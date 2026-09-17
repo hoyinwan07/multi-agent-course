@@ -1,18 +1,20 @@
 /**
- * LUMINA gateway — the software backend. PROVIDED SKELETON: YOU BUILD THIS OUT.
+ * LUMINA gateway — the software backend, and the only service the browser talks to.
  *
- * What is already here: the server, CORS, the request id, the pino request log, /health
- * (which nests the agent service's health), a 501 for every contract route, and the
- * static hosting of web/dist. That is deliberately the boring half.
+ * It answers three questions and delegates every other one: who is asking (`X-User-Id`),
+ * is the request well formed (zod, from the contract), and are they asking too often
+ * (a per-user window). Everything past that is the agent service's to answer, including
+ * which failure it was — this file mints exactly one status of its own, 502, and only when
+ * the agent could not be reached.
  *
- * What you build (backend/gateway/, see README Part 2):
- *   1. X-User-Id enforcement           → 401 without it, on every route but /health
- *   2. zod validation from @lumina/contract → 400 on a bad body, with the zod message
- *   3. a per-user rate limit           → 429
- *   4. the proxy to the agent service, and SSE pass-through for /threads/:id/ask
- *   5. 502 for any upstream failure    → never a 2xx when the agent threw
+ *   requireUser → 401 without X-User-Id, on every route but /health and /evals/report.json
+ *   validate    → 400 on a bad body, with the zod message
+ *   rateLimit   → 429, per user, per minute
+ *   proxy       → JSON passthrough, and byte-for-byte SSE for /threads/:id/ask
+ *   502         → any upstream failure. Never a 2xx when the agent threw.
  *
- * The browser talks ONLY to this service. No provider key is ever read here.
+ * No provider key is ever read here. That is the boundary the architecture is graded on:
+ * a key that reaches this process is a key one static-file bug away from the browser.
  */
 import express from 'express';
 import cors from 'cors';
@@ -20,8 +22,20 @@ import { pinoHttp } from 'pino-http';
 import pino from 'pino';
 import { randomUUID } from 'node:crypto';
 import { existsSync } from 'node:fs';
-import { HealthResponse, REQUEST_HEADER, ROUTES, USER_HEADER } from '@lumina/contract';
+import {
+  AskBody,
+  CreateSpaceBody,
+  CreateThreadBody,
+  HealthResponse,
+  REQUEST_HEADER,
+  USER_HEADER
+} from '@lumina/contract';
 import { env } from './env.js';
+import { rateLimit } from './middleware/rateLimit.js';
+import { requireUser } from './middleware/requireUser.js';
+import { validateBody } from './middleware/validate.js';
+import { proxyJson, proxyUpload } from './proxy/json.js';
+import { proxyStream } from './proxy/stream.js';
 
 const log = pino({ level: env.logLevel });
 const app = express();
@@ -82,34 +96,84 @@ app.get('/health', async (_req, res) => {
   res.status(ai.status === 'ok' ? 200 : 503).json(body);
 });
 
-// ---------------------------------------------------------------- everything else: 501
+// ---------------------------------------------------------------- /evals/report.json
 
 /**
- * Every contract route answers 501 until you implement it. The UI renders that as
- * "not implemented yet", so the interface is your progress bar: each route you finish
- * lights up a piece of the product.
+ * `auth: false` in the contract, and the bench probes it explicitly: the grader's tooling
+ * pulls this with no `X-User-Id` and it must not be a 401.
+ *
+ * Served straight off disk rather than proxied, because the agent service does not own it:
+ * `eval/build-report.mjs` writes it from the bench and quality runs, and everything in it
+ * is a measurement. Nothing here reads, edits, or fills in the file — a number on /evals
+ * that no run produced is the one dishonesty this page exists to prevent.
+ *
+ * Registered BEFORE the static handler so the report wins over any file of the same name.
  */
-const notImplemented = (route: string) => (_req: express.Request, res: express.Response) => {
-  res.status(501).json({
-    error: `not implemented yet: ${route}. Build it in backend/gateway/src/.`,
-    status: 501,
-    requestId: String(res.locals.requestId)
-  });
-};
+app.get('/evals/report.json', (_req, res) => {
+  if (!existsSync(env.reportPath)) {
+    // Honest 404: no report has been built. Not an empty object, which the UI would render
+    // as a product that scored zero.
+    res.status(404).json({
+      error: 'no eval report yet — run the eval to write reports/report.json',
+      status: 404,
+      requestId: String(res.locals.requestId)
+    });
+    return;
+  }
+  res.sendFile(env.reportPath);
+});
 
-for (const route of ROUTES) {
-  if (route.path === '/health') continue;
-  const path = route.path.replace(/:(\w+)/g, ':$1');
-  const method = route.method.toLowerCase() as 'get' | 'post' | 'delete';
-  app[method](path, notImplemented(`${route.method} ${route.path}`));
-}
+// ---------------------------------------------------------------- the proxied API
+//
+// Middleware order is the contract (§11.1):
+//
+//   cors → requestId → pino-http → requireUser → validate → rateLimit → proxy
+//
+// `requireUser` first, because no identity is a 401 whatever the body says. `validate`
+// next, so a malformed request dies at the edge and never spends the caller's quota.
+// `rateLimit` last before the proxy, because the limit is per user and needs the identity.
+//
+// Every status below 502 comes from the agent unchanged — including the 501s for the
+// routes it has not built yet, which is why this file no longer mints any. The UI keeps
+// its progress bar, and it now reflects what the agent service can actually do.
+
+app.get('/stats', requireUser, rateLimit, proxyJson);
+
+app.post('/threads', requireUser, validateBody(CreateThreadBody), rateLimit, proxyJson);
+app.get('/threads', requireUser, rateLimit, proxyJson);
+// No zod on `:threadId`: an id that does not exist must answer 404, and validating its
+// shape here would turn that into a 400 for anything the id regex disliked. Whether a
+// thread exists is a question only the agent can answer, so the whole question goes there.
+app.get('/threads/:threadId', requireUser, rateLimit, proxyJson);
+app.post('/threads/:threadId/ask', requireUser, validateBody(AskBody), rateLimit, proxyStream);
+
+app.get('/memory', requireUser, rateLimit, proxyJson);
+app.delete('/memory/:memoryId', requireUser, rateLimit, proxyJson);
+
+app.post('/spaces', requireUser, validateBody(CreateSpaceBody), rateLimit, proxyJson);
+app.get('/spaces', requireUser, rateLimit, proxyJson);
+// Streamed straight through, never buffered here: this route is exempt from express.json()
+// above so a 25MB PDF crosses the gateway without landing in its heap.
+app.post('/spaces/:spaceId/documents', requireUser, rateLimit, proxyUpload);
+app.get('/spaces/:spaceId/documents', requireUser, rateLimit, proxyJson);
 
 // ---------------------------------------------------------------- static UI
+
+/**
+ * An API path answers for itself; anything else is a client route and gets the SPA.
+ *
+ * `/evals` is NOT in this list even though `/evals/report.json` is, and the difference is
+ * the point: `/evals` is a page the UI links to with a plain `<a href>`, so a reader who
+ * opens the deployed URL and clicks "Evals" must be served `index.html`. Only the report
+ * file underneath it is an API path.
+ */
+const API_PATH = /^\/(health|stats|threads|memory|spaces|artifacts|evals\/report\.json)(\/|$)/;
 
 // In production the gateway serves the built UI, so / and /evals come from one origin.
 if (existsSync(env.webDist)) {
   app.use(express.static(env.webDist));
-  app.get(/^(?!\/(health|stats|threads|memory|spaces|artifacts|evals)).*/, (_req, res) => {
+  app.get(/.*/, (req, res, next) => {
+    if (API_PATH.test(req.path)) return next();
     res.sendFile(`${env.webDist}/index.html`);
   });
 }
@@ -126,7 +190,16 @@ app.use((err: Error, _req: express.Request, res: express.Response, _next: expres
 
 app.listen(env.port, () => {
   log.info(
-    { port: env.port, agentUrl: env.agentUrl, cors: env.corsOrigins },
-    'gateway up — every route but /health returns 501 until you build it'
+    {
+      port: env.port,
+      agentUrl: env.agentUrl,
+      cors: env.corsOrigins,
+      rateLimitPerMinute: env.rateLimitPerMinute,
+      // Names what is live, so a startup line that is out of date does not send the next
+      // reader looking for a bug in the wrong service.
+      servingUi: existsSync(env.webDist),
+      evalReport: existsSync(env.reportPath)
+    },
+    'gateway up — every contract route proxies to the agent; 501s now come from it, not from here'
   );
 });

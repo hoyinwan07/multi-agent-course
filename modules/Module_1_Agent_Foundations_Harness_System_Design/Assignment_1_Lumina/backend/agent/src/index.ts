@@ -42,6 +42,8 @@ import { mkdirSync } from 'node:fs';
 import { HealthResponse, ROUTES } from '@lumina/contract';
 import { env } from './env.js';
 import { pingDb } from './db.js';
+import { memoryRouter } from './http/memory.routes.js';
+import { threadsRouter } from './http/threads.routes.js';
 
 const log = pino({ level: env.logLevel });
 const app = express();
@@ -69,6 +71,14 @@ app.get('/health', async (_req, res) => {
   };
   res.status(dbStatus === 'ok' ? 200 : 503).json(body);
 });
+
+// ---------------------------------------------------------------- what is built
+
+// BEFORE the 501 loop, and that ordering is the whole point: Express matches handlers in
+// registration order, so a 501 registered first would shadow a real route and the service
+// would report "not implemented" for something that is.
+app.use(threadsRouter);
+app.use(memoryRouter);
 
 // ---------------------------------------------------------------- everything else: 501
 
@@ -101,6 +111,8 @@ app.listen(env.port, () => {
         deep: { toolCalls: env.maxToolCallsDeep, wallClockSec: env.maxWallClockSecDeep, dailyCap: env.deepDailyCap }
       }
     },
-    'agent up — every route but /health returns 501 until you build it'
+    // Names what is live, because a startup line that is out of date is a startup line
+    // that sends the next reader looking for a bug in the wrong service.
+    'agent up — /health, /threads and /memory are live; every other route is still 501'
   );
 });

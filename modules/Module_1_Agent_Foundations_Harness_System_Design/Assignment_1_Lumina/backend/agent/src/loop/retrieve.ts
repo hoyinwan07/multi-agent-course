@@ -31,8 +31,10 @@ const MAX_PARALLEL = 4;
  * The turn it removes cost a measured 1.5s of a 2500ms TTFT budget and ~2.7k input
  * tokens, and it almost always answered "DONE". The trade is real and belongs in
  * DESIGN.md: the model no longer gets to say "three pages, but none of them covers the
- * second half of the question, let me fetch one more". It only applies when every call
- * in the turn succeeded — a turn with a failed fetch always gets another pass.
+ * second half of the question, let me fetch one more". It applies once the STORE holds
+ * this many items, regardless of whether some other call in the same turn failed — see
+ * the exit check further down in `retrieve()` for why a failed `fetch_page` alongside
+ * enough successful ones is not a reason to spend another turn.
  */
 const MIN_EVIDENCE_TO_EXIT = 3;
 
@@ -313,11 +315,23 @@ export async function retrieve(args: RetrieveArgs): Promise<RetrieveOutcome> {
       return { terminated: 'cap', evidence: store.all(), turns, memories };
     }
 
-    // Enough material and nothing failed: stop here rather than spend a turn being told
-    // DONE. `done` is honest — the loop finished on its own terms, it just used a rule
-    // instead of a round trip to decide. A turn with any failure never takes this path.
-    const allOk = settled.every((s) => s.kind === 'ok' && s.result.ok);
-    if (allOk && store.size >= minEvidenceToExit) {
+    // Enough material to answer from: stop here rather than spend a turn being told DONE.
+    // `done` is honest — the loop finished on its own terms, it just used a rule instead of
+    // a round trip to decide.
+    //
+    // Originally gated on "and nothing failed in this turn" too, on the theory that a
+    // failure meant the model might want to compensate by fetching an alternative URL. In
+    // practice a `fetch_page` failure (403, paywall, JS-only page) is common and NOT
+    // evidence of a thin result: it says nothing about whether the OTHER calls in the same
+    // turn — the ones that succeeded and already pushed `store.size` over the threshold —
+    // are enough to answer from. Requiring every call in the turn to succeed before
+    // trusting evidence that already cleared the bar bought no quality: it just spent a
+    // second full LLM turn (measured ~74% of Phase 1 latency) that, per the eval, was
+    // costing quick runs the $0.05 budget and pushing them toward the 90s wall clock —
+    // exactly the runs later timing out or capping out. Phase 2 only ever reads `store`,
+    // never the raw tool-call outcomes, so a run that exits here loses nothing a
+    // continuing turn would have given the answer.
+    if (store.size >= minEvidenceToExit) {
       log.info({ turns, evidence: store.size }, 'phase 1 exited on the evidence threshold');
       return { terminated: 'done', evidence: store.all(), turns, memories };
     }

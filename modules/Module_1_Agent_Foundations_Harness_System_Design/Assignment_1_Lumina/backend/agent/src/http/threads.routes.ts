@@ -29,6 +29,7 @@ import { emptySpend } from '../obs/cost.js';
 import { logFor } from '../obs/log.js';
 import { writeRunLog } from '../obs/runlog.js';
 import { recentMessages, saveMessages } from '../repo/messages.js';
+import { findSpace } from '../repo/spaces.js';
 import { findThread, insertThread, listThreads, titleThreadIfUntitled } from '../repo/threads.js';
 import { requireUser } from './auth.js';
 import { SseEmitter, sseHeaders } from './sse.js';
@@ -146,15 +147,22 @@ threadsRouter.post('/threads/:threadId/ask', async (req: Request, res: Response)
     return;
   }
 
-  // One round trip for both, because both are needed before the stream opens and neither
-  // depends on the other. The lookup is what answers 404; the history read would otherwise
-  // add a second Atlas round trip to the TTFT path for nothing.
-  const [thread, priorMessages] = await Promise.all([
+  // One round trip for all of these, because none depends on another and all are needed
+  // before the stream opens. The lookups are what answer 404; the history read would
+  // otherwise add a second Atlas round trip to the TTFT path for nothing.
+  const [thread, priorMessages, space] = await Promise.all([
     findThread(threadId.data, userId),
-    recentMessages(threadId.data, HISTORY_FETCH)
+    recentMessages(threadId.data, HISTORY_FETCH),
+    body.data.spaceId ? findSpace(body.data.spaceId, userId) : Promise.resolve(undefined)
   ]);
   if (!thread) {
     res.status(404).json({ error: `no thread ${threadId.data}`, status: 404 });
+    return;
+  }
+  // A Space named in the body that does not exist, or belongs to somebody else, reads the
+  // same as one that was never named — 404, not a silent fall-through to empty retrieval.
+  if (body.data.spaceId && !space) {
+    res.status(404).json({ error: `no space ${body.data.spaceId}`, status: 404 });
     return;
   }
 
@@ -202,6 +210,8 @@ threadsRouter.post('/threads/:threadId/ask', async (req: Request, res: Response)
       userId,
       threadId: threadId.data,
       query,
+      mode: body.data.mode ?? 'auto',
+      ...(body.data.spaceId ? { spaceId: body.data.spaceId } : {}),
       depth,
       history,
       sse,

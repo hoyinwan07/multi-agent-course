@@ -22,6 +22,7 @@ import type { LlmToolDef } from '../providers/llm.js';
 import { fetchPage } from './fetch_page.js';
 import { recallMemory } from './recall_memory.js';
 import { saveMemory } from './save_memory.js';
+import { searchDocuments } from './search_documents.js';
 import { webSearch } from './web_search.js';
 import type { Tool, ToolContext, ToolResult } from './types.js';
 
@@ -29,13 +30,11 @@ import type { Tool, ToolContext, ToolResult } from './types.js';
  * Registered tools. `plan_research` is NOT here and must not be added in Week 1: a quick
  * run whose trace contains it is a red line in eval/rubric.json, and bench.mjs checks
  * every quick run for it.
- *
- * Week 1 note: `search_documents` (Week 2) lands here as it is built. Nothing else about
- * this file changes.
  */
 const REGISTRY: ReadonlyMap<string, Tool> = new Map<string, Tool>([
   [webSearch.name, webSearch],
   [fetchPage.name, fetchPage],
+  [searchDocuments.name, searchDocuments],
   [recallMemory.name, recallMemory],
   [saveMemory.name, saveMemory]
 ]);
@@ -43,17 +42,25 @@ const REGISTRY: ReadonlyMap<string, Tool> = new Map<string, Tool>([
 /**
  * The tools this gear may see, as the LLM provider's tool definitions.
  *
- * Two filters, and they are different kinds of thing. `forbiddenTools` is a spend
+ * Three filters, and they are different kinds of thing. `forbiddenTools` is a spend
  * boundary the CONTRACT owns — a quick run may not see `plan_research`. `systemOnly` is an
  * architectural one WE own: `recall_memory` is fired by the loop before the model's first
  * turn, so offering it to the model as well can only buy a duplicate call for something
- * already sitting in the prompt.
+ * already sitting in the prompt. The mode/Space check below is the router (§5.4): a
+ * request with no Space attached has nothing for `search_documents` to search, and a
+ * request explicitly scoped to `mode: 'docs'` has asked NOT to leave the Space, so
+ * `web_search` is withheld rather than left for the model to (mis)judge.
  */
-export function forGear(gear: Gear): LlmToolDef[] {
+export function forGear(gear: Gear, ctx: Pick<ToolContext, 'mode' | 'spaceId'>): LlmToolDef[] {
   const out: LlmToolDef[] = [];
   for (const tool of REGISTRY.values()) {
     if (gear.forbiddenTools.includes(tool.name)) continue;
     if (tool.systemOnly) continue;
+    if (tool.name === 'search_documents' && (!ctx.spaceId || ctx.mode === 'web')) continue;
+    // `fetch_page` only ever reads an http(s) URL, and the only tool that surfaces one is
+    // `web_search` — withheld here too, so `mode: 'docs'` cannot drift into the web by the
+    // model inventing a URL nobody offered it.
+    if ((tool.name === 'web_search' || tool.name === 'fetch_page') && ctx.mode === 'docs') continue;
     out.push({ name: tool.name, description: tool.description, inputSchema: tool.inputSchema });
   }
   // Stable order: the tool list is part of the cacheable prefix, and a set iterated in a

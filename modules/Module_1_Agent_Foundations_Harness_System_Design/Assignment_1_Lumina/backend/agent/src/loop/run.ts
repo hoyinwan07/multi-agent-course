@@ -8,6 +8,7 @@
 import {
   newId,
   unresolvedCitations,
+  type AskMode,
   type Depth,
   type DoneEvent,
   type Source,
@@ -31,6 +32,10 @@ export type RunArgs = {
   threadId: string;
   query: string;
   depth: Depth;
+  /** web | docs | auto — the router (§5.4). Defaults applied by the contract, not here. */
+  mode: AskMode;
+  /** Set only when the request named a Space. */
+  spaceId?: string;
   /**
    * Prior turns of this thread, already bounded and stripped by `loop/history.ts`.
    *
@@ -65,7 +70,7 @@ export type RunOutcome = {
 };
 
 export async function run(args: RunArgs): Promise<RunOutcome> {
-  const { requestId, userId, threadId, query, depth, history, sse, signal } = args;
+  const { requestId, userId, threadId, query, depth, mode, spaceId, history, sse, signal } = args;
 
   const startedAt = Date.now();
   const answerId = newId('ans');
@@ -79,6 +84,8 @@ export async function run(args: RunArgs): Promise<RunOutcome> {
     userId,
     threadId,
     query,
+    mode,
+    ...(spaceId ? { spaceId } : {}),
     signal,
     search: newSearchAccounting(),
     embeddingTokens: { total: 0 },

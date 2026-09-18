@@ -57,6 +57,7 @@ for (const query of queries) {
     userId: 'preflight',
     threadId: 'thr_preflight',
     query,
+    mode: 'auto',
     signal: AbortSignal.timeout(60_000),
     search: newSearchAccounting(),
     embeddingTokens: { total: 0 },

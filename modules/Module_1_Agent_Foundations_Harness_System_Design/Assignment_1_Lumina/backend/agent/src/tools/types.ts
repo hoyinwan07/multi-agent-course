@@ -6,7 +6,7 @@
  * decide to keep the run alive by returning a cheerful empty result — that decision is
  * made by type, at the throw site, and the registry honours it.
  */
-import type { ToolName } from '@lumina/contract';
+import type { AskMode, ToolName } from '@lumina/contract';
 import type { EvidenceItem } from '../evidence/store.js';
 
 /** Counters behind `searchCached` (§7.2). Fetches are not searches and never touch these. */
@@ -23,6 +23,10 @@ export type ToolContext = {
   threadId: string;
   /** The user's question. Snippet scoring and search-tool heuristics read it. */
   query: string;
+  /** web | docs | auto (§5.4's router). Which retrieval tools get shown, not just used. */
+  mode: AskMode;
+  /** Set only when the request named a Space. `search_documents` has nothing to search without it. */
+  spaceId?: string;
   /** Aborted on client disconnect: a closed tab must not keep paying a provider. */
   signal: AbortSignal;
   search: SearchAccounting;

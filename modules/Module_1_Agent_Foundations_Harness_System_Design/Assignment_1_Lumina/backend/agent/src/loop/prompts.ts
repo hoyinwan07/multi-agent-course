@@ -16,13 +16,45 @@ import type { Gear } from './gear.js';
  * The model keeps the judgement that mattered — rewriting a question into search terms —
  * but only spends a turn on it when the first results are actually off-target.
  */
-export function retrieveSystemPrompt(gear: Gear): string {
+export function retrieveSystemPrompt(gear: Gear, retrieval: { wantWeb: boolean; wantDocs: boolean }): string {
+  const { wantWeb, wantDocs } = retrieval;
+
+  // What already ran, stated accurately: a request scoped to `mode: 'docs'` never touches
+  // the web, and the sentence must not tell the model otherwise — even though it is also
+  // harmless here, since a tool that was not run is also not offered (`registry.forGear`).
+  const already = wantWeb && wantDocs
+    ? 'A web search and a search of this Space\'s documents have already been run on the raw question, and you are shown both sets of results.'
+    : wantWeb
+      ? 'A web search has already been run on the raw question, and you are shown its results.'
+      : wantDocs
+        ? 'A search of this Space\'s documents has already been run on the raw question, and you are shown its results.'
+        : 'No search has been run yet — this request named no Space and is scoped to documents only.';
+
+  const refineTools = [...(wantWeb ? ['web_search'] : []), ...(wantDocs ? ['search_documents'] : [])].join(' or ');
+  const step1 = refineTools
+    ? [
+        '1. Look at the results you were given. If they are on-target, go straight to step 2.',
+        '   If they are clearly off-target — wrong topic, wrong sense of an ambiguous word —',
+        `   call ${refineTools} ONCE more with better keywords. Do not refine more than once.`
+      ]
+    : ['1. There is nothing to refine — no retrieval tool is available for this request.'];
+
+  const step2 = wantWeb
+    ? [
+        '2. Call fetch_page on the 3-4 most promising URLs — emit all of those calls in a',
+        '   SINGLE turn so the pages are read in parallel. Never fetch them one at a time.'
+      ]
+    : [
+        '2. If a document result looks promising but you want more of the Space, call',
+        '   search_documents again with different keywords — but only once more (step 1).'
+      ];
+
   return [
     'You are the retrieval stage of a research assistant. Your only job is to gather',
     'source material. You are NOT writing the answer — another stage does that, and',
     'anything you write here is discarded.',
     '',
-    'A web search has already been run on the raw question, and you are shown its results.',
+    already,
     '',
     'Earlier turns of this conversation may appear before the question. They are there for',
     'ONE purpose: working out what the question refers to when it uses a pronoun or leaves',
@@ -30,16 +62,14 @@ export function retrieveSystemPrompt(gear: Gear): string {
     'the question stands on its own, ignore them — an earlier topic is not part of it.',
     '',
     'How to work:',
-    '1. Look at the results you were given. If they are on-target, go straight to step 2.',
-    '   If they are clearly off-target — wrong topic, wrong sense of an ambiguous word —',
-    '   call web_search ONCE more with better keywords. Do not refine more than once.',
-    '2. Call fetch_page on the 3-4 most promising URLs — emit all of those calls in a',
-    '   SINGLE turn so the pages are read in parallel. Never fetch them one at a time.',
-    '3. Stop. If you have read enough pages, reply with the single word DONE.',
+    ...step1,
+    ...step2,
+    '3. Stop. If you have read enough, reply with the single word DONE.',
     '',
     'Rules:',
-    '- Search results are links. Their teaser text is not a source and may never be quoted.',
-    '  Only a successful fetch_page produces text the answer may cite.',
+    '- A web search\'s results are links. Their teaser text is not a source and may never be',
+    '  quoted — only a successful fetch_page turns a link into citable text. A Space search',
+    '  is different: it returns citable passages directly, already retrieved.',
     '- If a fetch fails, that is normal. Continue with the pages you did get, or fetch one',
     '  replacement. Never retry the same URL.',
     '- If nothing usable can be found, stop and reply DONE. Reporting that nothing was',
@@ -47,16 +77,17 @@ export function retrieveSystemPrompt(gear: Gear): string {
     // Measured, not theoretical: "What is the capital of Portugal?" retrieved NOTHING —
     // the model read the search results, decided it already knew the answer, and replied
     // DONE on turn 1 with zero fetches. The answer that came back was "I have no sources
-    // and cannot answer", because Phase 2 is shown only fetched text and is forbidden to
+    // and cannot answer", because Phase 2 is shown only retrieved text and is forbidden to
     // use its own knowledge. The model cannot see that consequence from inside Phase 1, so
     // the prompt has to state it. It is also not a hypothetical corner: this is the exact
     // question bench.mjs asks in its memory phase.
-    '- A question you are confident you already know the answer to STILL gets pages fetched.',
-    '  You are not the stage that answers. The stage that does is shown ONLY the text you',
-    '  fetch and may not use its own knowledge, so skipping the fetch does not produce a',
-    '  short correct answer — it produces "I have no sources and cannot answer".',
-    '- Never reply DONE before at least one fetch_page has succeeded. The only exceptions',
-    '  are that every fetch failed, or the search returned nothing to fetch.',
+    '- A question you are confident you already know the answer to STILL gets researched',
+    '  with the tools available to you. You are not the stage that answers. The stage that',
+    '  does is shown ONLY the text retrieval produces and may not use its own knowledge, so',
+    '  skipping retrieval does not produce a short correct answer — it produces "I have no',
+    '  sources and cannot answer".',
+    '- Never reply DONE with no usable evidence yet, unless every available tool has',
+    '  already been tried and came up empty or failed.',
     '',
     // Retrieval is the only stage that holds tools, so the one durable WRITE the product
     // has is exercised from here or not at all. It is kept off the numbered flow and put
@@ -66,15 +97,15 @@ export function retrieveSystemPrompt(gear: Gear): string {
     'fact about themselves — how they want answers written, what they work in, who they are',
     '— call save_memory with it, as one self-contained sentence. Only for things that will',
     'still be true and still useful in an unrelated conversation next month; never for the',
-    'subject of this question, and never for something you just read on a page. Saving is in',
-    'addition to the work above, not instead of it: a question that also carries a preference',
-    'still gets its pages fetched.',
+    'subject of this question, and never for something you just read or retrieved. Saving is',
+    'in addition to the work above, not instead of it: a question that also carries a',
+    'preference still gets researched.',
     '',
-    'The single exception to the fetch rule: a request that asks ONLY to remember something',
-    'and contains no question. Save it, reply DONE, fetch nothing.',
+    'The single exception to the research rule above: a request that asks ONLY to remember',
+    'something and contains no question. Save it, reply DONE, retrieve nothing.',
     '',
     `Budget: at most ${gear.maxToolCalls} tool calls and ${gear.wallClockSec} seconds.`,
-    'The fast path is one turn: fetch three or four pages together, and you are finished.'
+    'The fast path is one turn: gather three or four sources together, and you are finished.'
   ].join('\n');
 }
 
@@ -91,11 +122,22 @@ export function retrieveSystemPrompt(gear: Gear): string {
  * which is the cacheable prefix. A per-user memory block spliced into the system prompt
  * would mint a fresh cache entry per user and quietly cost more than it saves.
  */
-export function openingUserMessage(query: string, eagerSearch: string | null, memories: string | null): string {
+export type OpeningUserMessageArgs = {
+  query: string;
+  webSearch: string | null;
+  docSearch: string | null;
+  memories: string | null;
+};
+
+export function openingUserMessage(args: OpeningUserMessageArgs): string {
+  const { query, webSearch, docSearch, memories } = args;
   return [
     ...(memories ? [memories, ''] : []),
     `Question: ${query}`,
-    ...(eagerSearch ? ['', 'A web search has already been run on this question. Its results:', '', eagerSearch] : [])
+    ...(webSearch ? ['', 'A web search has already been run on this question. Its results:', '', webSearch] : []),
+    ...(docSearch
+      ? ['', 'This Space has already been searched for this question. What it found:', '', docSearch]
+      : [])
   ].join('\n');
 }
 

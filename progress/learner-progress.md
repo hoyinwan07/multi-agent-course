@@ -17,7 +17,7 @@
 
 | Module | Status | Notes / weak spots |
 |--------|--------|--------------------|
-| 01 — Agent Foundations, Agent Harness & System Design | in progress | Learner is well past lesson content, actively building the Module 1 project (LUMINA) directly with Claude as engineering partner rather than through `teach-module`. Week 1 (loop, tools, gateway, memory) shipped and deployed (Vercel + Fly.io) before this session. This session (2026-09-18): built `POST /spaces`, `GET /spaces`, upload/list documents routes, and the jobs worker (GridFS → pdfjs-dist parse → chunk → embed → read-your-write probe → `indexed`) per `SPEC.md` §5.4 — unblocked `node eval/eval.mjs` past Gate 2 (was crashing on `501 POST /spaces`). Remaining on LUMINA: hybrid retrieval (`search_documents` + RRF), `GET /stats`, deep search — see `Assignment_1_Lumina/HANDOFF.md` for the live state. No signal yet on whether the learner wants the underlying course concepts (harness design, async job patterns) taught/quizzed separately from building them. |
+| 01 — Agent Foundations, Agent Harness & System Design | in progress | Learner is well past lesson content, actively building the Module 1 project (LUMINA) directly with Claude as engineering partner rather than through `teach-module`. Week 1 (loop, tools, gateway, memory) shipped and deployed (Vercel + Fly.io) before this session. This session (2026-09-18), two passes: (1) built `POST /spaces`, `GET /spaces`, upload/list documents routes, and the jobs worker (GridFS → pdfjs-dist parse → chunk → embed → read-your-write probe → `indexed`) per `SPEC.md` §5.4 — unblocked `node eval/eval.mjs` past Gate 2; committed (`5c6be0f`). (2) built hybrid retrieval — `search_documents` tool, `$vectorSearch`+`$search` fused by RRF in `repo/chunks.ts`, wired into the router (`mode: 'web'/'docs'/'auto'`) via `ToolContext`/`forGear`/`retrieve.ts` — `recall@5` went 0/3 → 3/3 on the smoke bench; not yet committed, pending learner confirmation. Remaining on LUMINA: `GET /stats`, deep search — see `Assignment_1_Lumina/HANDOFF.md` for the live state. No signal yet on whether the learner wants the underlying course concepts (harness design, async job patterns, RRF) taught/quizzed separately from building them. |
 | 02 — Skills & Subagents: Product Architecture & Coordination | not started | |
 | 03 — Production Agentic RAG & AI Systems | not started | |
 | 04 — Multi-Agent Systems & Orchestration | not started | |
@@ -31,6 +31,6 @@ Status values: not started · in progress · completed · needs review
 - [none yet]
 
 ## Next step
-- Continue LUMINA Week 2: build hybrid retrieval (`search_documents` tool, RRF fusion,
-  router wiring for `mode: 'docs'`/`'auto'`), then `GET /stats`, then deep search. See
+- Commit the hybrid retrieval work (awaiting learner go-ahead), then continue LUMINA
+  Week 2 with `GET /stats`, then deep search. See
   `modules/Module_1_Agent_Foundations_Harness_System_Design/Assignment_1_Lumina/HANDOFF.md`.

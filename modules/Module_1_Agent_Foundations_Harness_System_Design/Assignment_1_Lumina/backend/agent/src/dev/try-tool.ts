@@ -5,6 +5,7 @@
  *
  *   npx tsx src/dev/try-tool.ts fetch_page '{"url":"https://example.com"}'
  *   npx tsx src/dev/try-tool.ts web_search '{"query":"mongodb atlas vector search"}'
+ *   npx tsx src/dev/try-tool.ts search_documents '{"query":"..."}' spc_yourSpaceId
  *
  * Not wired into the server, not on any route.
  */
@@ -13,10 +14,10 @@ import * as registry from '../tools/registry.js';
 import { isProviderError } from '../lib/errors.js';
 import { newMemoryAccounting, newSearchAccounting, searchCachedFrom, type ToolContext } from '../tools/types.js';
 
-const [name, rawInput = '{}'] = process.argv.slice(2);
+const [name, rawInput = '{}', spaceId] = process.argv.slice(2);
 
 if (!name) {
-  console.error('usage: tsx src/dev/try-tool.ts <tool> \'<json input>\'');
+  console.error('usage: tsx src/dev/try-tool.ts <tool> \'<json input>\' [spaceId]');
   process.exit(2);
 }
 
@@ -25,6 +26,8 @@ const ctx: ToolContext = {
   userId: 'dev',
   threadId: 'thr_dev',
   query: typeof JSON.parse(rawInput).query === 'string' ? JSON.parse(rawInput).query : 'dev query',
+  mode: 'auto',
+  ...(spaceId ? { spaceId } : {}),
   signal: AbortSignal.timeout(30_000),
   search: newSearchAccounting(),
   embeddingTokens: { total: 0 },

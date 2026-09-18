@@ -93,35 +93,49 @@ export async function retrieve(args: RetrieveArgs): Promise<RetrieveOutcome> {
   let toolCallCount = 0;
   let turns = 0;
 
-  // ---- THE TWO EAGER CALLS ----
+  // ---- THE EAGER CALLS ----
   //
-  // Both are real registry calls — traced, counted against the cap, billed — they simply
-  // are not model-chosen. Recall has to be in the prompt BEFORE the model reasons, and
+  // All real registry calls — traced, counted against the cap, billed — they simply are
+  // not model-chosen. Recall has to be in the prompt BEFORE the model reasons, and a
   // search is a thing we always want; paying an LLM round trip to be told to do either
   // costs a measured 1.8s of a TTFT budget that has none to spare (§5.4).
   //
+  // WHICH SEARCHES is the router (§5.4): `mode: 'web'` searches the web only, `'docs'`
+  // searches only a Space (and only if one was named — otherwise there is nothing to
+  // search and the run proceeds on memory alone), and `'auto'` runs both when a Space IS
+  // attached — a request that bothered to name a Space is treated as one where the Space
+  // is presumptively relevant, and the model still gets a full evidence set to write from
+  // either way. `'auto'` with no Space is exactly Week 1's web-only behaviour, unchanged.
+  const wantWeb = ctx.mode !== 'docs';
+  const wantDocs = Boolean(ctx.spaceId) && ctx.mode !== 'web';
+
   // RUN TOGETHER, REPORTED IN ORDER. Recall is an embedding call plus a vector query,
-  // ~250ms; the search is ~1.4s. Sequentially that is 250ms of pure TTFT added to every
-  // request in the product. Concurrently it is free, because recall finishes inside the
-  // search's latency. They share no state, so there is nothing to serialize for. The trace
-  // steps are still emitted recall-then-search, which is the order a reader expects and the
-  // order the run logically has.
+  // ~250ms; each search is roughly as expensive. Sequentially that is real TTFT added to
+  // every request. Concurrently it is close to free, because they share no state and there
+  // is nothing to serialize for. The trace steps are still emitted recall-then-searches, in
+  // the fixed order below, which is the order a reader expects and the order the run
+  // logically has.
   //
-  // BOTH COUNT AGAINST THE CAP. Not a philosophical position — `bench.mjs:673` scores the
+  // ALL COUNT AGAINST THE CAP. Not a philosophical position — `bench.mjs:673` scores the
   // quick envelope as `(a.trace ?? []).length > 8`, i.e. it counts TRACE STEPS, and every
-  // eager call emits one. If recall were exempt from `gear.maxToolCalls`, a run could spend
-  // its full 8 tool calls and emit 9 trace steps, and the gate would fail a run that had
-  // obeyed its own cap exactly. Counting it makes the internal cap enforce the external
-  // check by construction.
-  const [recalled, eager] = await Promise.all([
+  // eager call emits one. If one of these were exempt from `gear.maxToolCalls`, a run could
+  // spend its full budget of tool calls and emit one more trace step than that, and the
+  // gate would fail a run that had obeyed its own cap exactly. Counting it makes the
+  // internal cap enforce the external check by construction.
+  const eagerNames: ('web_search' | 'search_documents')[] = [
+    ...(wantWeb ? (['web_search'] as const) : []),
+    ...(wantDocs ? (['search_documents'] as const) : [])
+  ];
+  const [recalled, ...eagerResults] = await Promise.all([
     eagerRecall(query, ctx, gear, log),
-    timed(() => registry.run('web_search', { query }, ctx, gear))
+    ...eagerNames.map((name) => timed(() => registry.run(name, { query }, ctx, gear)))
   ]);
+  const eagerByName = new Map(eagerNames.map((name, i) => [name, eagerResults[i]!]));
 
   for (const [name, { result, ms }] of [
-    ['recall_memory', recalled],
-    ['web_search', eager]
-  ] as const) {
+    ['recall_memory', recalled] as const,
+    ...eagerNames.map((name) => [name, eagerByName.get(name)!] as const)
+  ]) {
     toolCallCount += 1;
     sse.emitTrace({
       step: sse.nextStep(),
@@ -133,17 +147,27 @@ export async function retrieve(args: RetrieveArgs): Promise<RetrieveOutcome> {
       ...(result.ok ? {} : { error: result.error })
     });
     toolCalls.push({ name, ok: result.ok, ms, ...(result.ok ? {} : { error: result.error }) });
+    // A tool that produced evidence eagerly (search_documents) freezes it into the store
+    // exactly like a model-called one does — there is no second copy of this logic.
+    if (result.ok && result.evidence?.length) store.add(...result.evidence);
   }
 
   // An empty observation means "this user has nothing stored", which is the normal case and
   // must not put an empty heading in front of every question.
   const memories = recalled.result.ok && recalled.result.observation ? recalled.result.observation : null;
+  const webResult = eagerByName.get('web_search');
+  const docsResult = eagerByName.get('search_documents');
 
   const messages: LlmMessage[] = [
     ...history,
     {
       role: 'user',
-      text: openingUserMessage(query, eager.result.ok ? eager.result.observation : null, memories)
+      text: openingUserMessage({
+        query,
+        webSearch: webResult?.result.ok ? webResult.result.observation : null,
+        docSearch: docsResult?.result.ok ? docsResult.result.observation : null,
+        memories
+      })
     }
   ];
 
@@ -160,9 +184,9 @@ export async function retrieve(args: RetrieveArgs): Promise<RetrieveOutcome> {
     turns += 1;
     const turnStart = Date.now();
     const reply = await llm.complete({
-      system: retrieveSystemPrompt(gear),
+      system: retrieveSystemPrompt(gear, { wantWeb, wantDocs }),
       messages,
-      tools: registry.forGear(gear),
+      tools: registry.forGear(gear, ctx),
       // The deadline is an abort, not just a check: a hung provider must not be able to
       // run past the cap while we wait politely for it.
       signal: AbortSignal.any([ctx.signal, AbortSignal.timeout(Math.max(1, deadline - Date.now()))])

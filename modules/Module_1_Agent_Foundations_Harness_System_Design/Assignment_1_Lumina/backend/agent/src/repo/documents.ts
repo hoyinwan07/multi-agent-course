@@ -42,6 +42,16 @@ export async function listDocuments(spaceId: string, userId: string): Promise<Do
   return (await rows.find({ spaceId, userId }).sort({ createdAt: 1 }).toArray()) as DocumentDoc[];
 }
 
+/** `search_documents` gets a docId + locator from `chunks`; the citable title lives here. */
+export async function documentTitles(docIds: string[], userId: string): Promise<Map<string, string>> {
+  if (!docIds.length) return new Map();
+  const rows = await documents();
+  const found = await rows
+    .find({ _id: { $in: docIds }, userId }, { projection: { title: 1 } })
+    .toArray();
+  return new Map(found.map((d) => [d._id, d.title]));
+}
+
 export type DocumentProgress = Partial<
   Pick<DocumentDoc, 'status' | 'pct' | 'pages' | 'chunks' | 'error'>
 >;

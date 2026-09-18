@@ -44,16 +44,13 @@ Deep search itself hangs off the **existing** `POST /threads/:threadId/ask` rout
 `{"depth":"deep"}` — no new route, but the Phase 1 loop needs to plan sub-questions, research
 each, and merge into one citation numbering (README's build-sequence step 8).
 
+**Hybrid retrieval is ALSO done now (same session, second pass)** — see "Done this session,
+part 2" below. `recall@5` went from `0/3` to `3/3` on the smoke bench.
+
 **What's next, in order:**
-1. **Hybrid retrieval** (README step 7): a `search_documents` tool over `chunks` —
-   `$vectorSearch` + `$search` fused with RRF, registered in `tools/registry.ts`, and wired
-   into the router so `mode: 'docs'` and `mode: 'auto'` actually call it. `repo/chunks.ts`
-   already exports `upsertChunks`/`probeChunkIndexed`; the retrieval query itself is not
-   written yet. **This is why `recall@5` is still `0/3` in this session's bench run** — the
-   documents are indexed correctly, nothing retrieves from them yet.
-2. `GET /stats` — deep-run cost + `deepDailyCap` remaining, off the `requests`/`runs`
+1. `GET /stats` — deep-run cost + `deepDailyCap` remaining, off the `requests`/`runs`
    collections already populated in Week 1.
-3. Deep search (README step 8): `plan_research` fan-out + merged citation numbering.
+2. Deep search (README step 8): `plan_research` fan-out + merged citation numbering.
 
 **Done this session — Spaces + jobs worker (§5.4):**
 - New `repo/` files (the only files touching their collection, per the `repo/` rule):
@@ -84,6 +81,42 @@ each, and merge into one citation numbering (README's build-sequence step 8).
 
 **Not built / deliberately out of scope this session:** re-index-on-replace and
 delete-a-document (§5.4 lists both as "Could", not "Must").
+
+**Done this session, part 2 — hybrid retrieval (§5.4):**
+- `tools/search_documents.ts`: embeds the query, calls `repo/chunks.ts`'s new
+  `hybridSearchChunks` (dense `$vectorSearch` + BM25 `$search` on `chunks_text`, both
+  scoped to `spaceId`+`userId` INSIDE their own stage, fused by reciprocal rank fusion —
+  `RRF_K=60`, top 20 candidates per side, top 8 after fusion, all named consts next to the
+  function per SPEC's "declared in config, not hard-coded"). No separate re-rank call after
+  fusion — documented in-code as the deliberate "or a documented reason for skipping it"
+  choice, given the already-open latency budget. One evidence item per PAGE/heading/line,
+  not per chunk (dedupes multiple chunks of one locator, keeping the highest-RRF one).
+- Registered in `tools/registry.ts`; `forGear` now also takes `ctx` and hides
+  `search_documents` when no Space is attached or `mode:'web'`, and hides
+  `web_search`+`fetch_page` when `mode:'docs'` (a request scoped to documents cannot drift
+  into the web by the model inventing a URL nobody offered it).
+- `ToolContext` (`tools/types.ts`) gained `mode`/`spaceId`; threaded through
+  `loop/run.ts` → `loop/retrieve.ts` from `POST /threads/:id/ask`'s body (`http/threads.routes.ts`
+  now also 404s an unknown/foreign `spaceId` the same way it 404s an unknown thread).
+- `loop/retrieve.ts`'s eager-call logic now runs `web_search`, `search_documents`, or both,
+  based on `mode`+`spaceId` — `'auto'` with no Space is byte-identical to Week 1 (web only);
+  `'auto'` with a Space blends both; `'docs'` runs the Space search only. Eager
+  `search_documents` evidence is frozen into the store exactly like a model-called one.
+- `loop/prompts.ts`'s retrieval system prompt is now parameterized by which retrieval tools
+  are actually available this request, so it never tells the model a web search ran when
+  `mode:'docs'` means it didn't; the fetch-specific rules were generalized to apply to
+  either retrieval path rather than assuming `fetch_page` is mandatory.
+- `repo/documents.ts` gained `documentTitles` (batch title lookup for citation rendering).
+- Verified against the ALREADY-INDEXED corpus from part 1: `mode:'docs'` question →
+  citation `[1]` resolves to `retrieval-basics.pdf, p. 1` with the exact "The common
+  default is 1.2" snippet, grounded; `mode:'auto'` with a Space blends `kind:'doc'` and
+  `kind:'web'` sources in one answer; `mode:'web'` unchanged (regression-checked by hand).
+  `node benchmark/bench.mjs --smoke`: **`recall@5` 3/3** (was 0/3), `indexedViaWorker`,
+  `pageLocator`, `routerPicksDocs`, `groundingMet`, `retrievalAlways` all pass. `accept202`
+  missed at 350ms vs the 300ms p95 target on this one small local run — worth another data
+  point, not yet a real finding. `ttft`/`answer` p95 still miss — the same pre-existing
+  Week 1 finding, untouched by this work. `node quality/check.mjs .`: back to 0 errors (same
+  2 pre-existing warnings). Typecheck + lint clean throughout.
 
 Read, in order: `README.md` → `packages/contract/src/http.ts` (spaces/documents schemas) →
 `TECHNICAL.md` (search for the RAG/Spaces and Deep Search sections — build guide, commands,
@@ -257,12 +290,14 @@ dev/          try-tool.ts  check-grounding.ts  try-citations.ts  try-cache.ts  t
               try-memory.ts
 index.ts      threadsRouter + memoryRouter mounted BEFORE the 501 loop
 ```
-Week 2, added this session: `repo/spaces.ts`, `repo/documents.ts`, `repo/chunks.ts`,
-`repo/jobs.ts`, `repo/uploads.ts`, `ingest/parse.ts`, `ingest/chunk.ts`,
-`ingest/index-document.ts`, `http/spaces.routes.ts`, `worker.ts` (rewritten). Still to build:
-hybrid retrieval (a `search_documents` tool over `chunks`, registered in `tools/registry.ts`
-and wired into the router), `GET /stats`, and deep-search planning
-(`tools/plan_research.ts` already exists but is unregistered/unused).
+Week 2, added this session: `repo/spaces.ts`, `repo/documents.ts` (+`documentTitles`),
+`repo/chunks.ts` (+`hybridSearchChunks`/RRF), `repo/jobs.ts`, `repo/uploads.ts`,
+`ingest/parse.ts`, `ingest/chunk.ts`, `ingest/index-document.ts`, `http/spaces.routes.ts`,
+`tools/search_documents.ts`, `worker.ts` (rewritten). Touched: `tools/registry.ts`
+(mode/Space-aware `forGear`), `tools/types.ts` (`mode`/`spaceId` on `ToolContext`),
+`loop/retrieve.ts` (router-driven eager calls), `loop/prompts.ts` (mode-parameterized
+system prompt), `loop/run.ts`, `http/threads.routes.ts`. Still to build: `GET /stats`, and
+deep-search planning (`tools/plan_research.ts` already exists but is unregistered/unused).
 
 ## Files built (gateway — Week 1, all complete)
 ```
@@ -339,13 +374,11 @@ flyctl deploy -c fly.gateway.toml --ha=false
 - **A decision on the cost AND latency gates** — still open, see Known risks.
 - `SERPAPI_API_KEY` — not set locally or on Fly.
 - **Commit the 5 deploy config files** sitting uncommitted right now (see Git state).
-- **Rest of Week 2**: hybrid retrieval (`search_documents`, RRF fusion, router wiring) +
-  deep search + `/stats`. Spaces + the jobs worker are done (this session) — see above.
+- **Rest of Week 2**: deep search + `/stats`. Spaces, the jobs worker, and hybrid retrieval
+  are all done (this session) — see above.
 
-**Next session should:** commit the deploy files AND this session's new Spaces/worker files
-(all currently untracked/modified, listed below), then build hybrid retrieval —
-`search_documents` over `chunks` with `$vectorSearch` + `$search` fused by RRF, registered
-in `tools/registry.ts`, wired into the router for `mode: 'docs'`/`'auto'`. That is what turns
-this session's `recall@5 0/3` into a real number and is the last thing standing between
-Gate 2 and an actual pass (the ttft/answer p95 misses are the pre-existing Week 1 finding
-above, a separate decision still open).
+**Next session should:** commit this session's work (Spaces + worker + hybrid retrieval —
+see git state below), then build `GET /stats` (cheap — `requests`/`runs` already carry
+everything it needs) and deep search (`plan_research` fan-out + merged citation numbering).
+The ttft/answer p95 misses are the one thing still open from Week 1 and are a separate
+decision (see Known risks), not something either of these blocks on.

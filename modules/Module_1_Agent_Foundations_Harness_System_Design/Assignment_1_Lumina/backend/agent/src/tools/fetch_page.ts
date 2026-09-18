@@ -45,6 +45,52 @@ const FETCH_TIMEOUT_MS = 6000;
 /** jsdom parses whatever it is handed. A 20 MB page is a memory event, not a source. */
 const MAX_BYTES = 2_000_000;
 
+/**
+ * THE PARSE BUDGET — the single biggest lever on ttft p95, and the one thing in this file
+ * that is about latency rather than grounding.
+ *
+ * `extract()` is the only synchronous, CPU-bound step in the whole request path, and this
+ * service is one Node event loop on one shared vCPU. A jsdom parse does not yield: while
+ * it runs, nothing else on the machine progresses — not another request's page fetch, not
+ * its SSE writes, not the sockets carrying its LLM stream. So one big page does not slow
+ * one answer down, it freezes every answer in flight.
+ *
+ * Measured, 2026-09-18, against the deployed agent at the bench's own concurrency of 4:
+ * three unrelated requests all produced their first token at the same instant, 23.68s in,
+ * because one of them was parsing
+ * `elastic.co/docs/.../reciprocal-rank-fusion` — 1.87 MB of HTML that takes 5-6s of
+ * straight-line CPU locally and was logged as an 18.2s `fetch_page` on Fly. That single
+ * page is the ttft p95 of 24.4s.
+ *
+ * What makes it 1.87 MB is not article: the stripped document is 8,610 `<span>`, 7,095
+ * `<li>` and 7,091 `<a>` against 55 `<p>` — the entire Elasticsearch docs tree inlined
+ * into the nav of every page. The article itself is 18,034 characters and sits in the
+ * first quarter of the file, and `PAGE_TOKEN_BUDGET` above keeps only ~5k of those
+ * characters anyway.
+ *
+ * So the two steps below bound the parse without touching what comes out of it:
+ *
+ *   `stripNonContent`  removes script/style/svg/noscript/template/comments before jsdom
+ *                      builds a node for each of them. Readability already ignores all
+ *                      six, so this cannot change the extraction — verified byte-for-byte
+ *                      across the bench's real pages. Worth 2x on a script-heavy page
+ *                      (mongodb.com: 909 KB → 168 KB) and nothing at all on elastic.co,
+ *                      whose bulk is markup that Readability does look at.
+ *
+ *   `PARSE_BYTE_BUDGET` is what actually catches elastic.co: 250 KB of post-strip markup
+ *                      holds far more prose than `PAGE_TOKEN_BUDGET` can keep (the densest
+ *                      page measured, freecodecamp, yields 37k characters of article from
+ *                      89 KB), so a document that is still over the budget after stripping
+ *                      is one whose tail is navigation. Measured on elastic.co: 5,197ms →
+ *                      603ms, extracted text byte-identical at 18,034 characters.
+ *
+ * The residual risk is a page whose article sits AFTER 250 KB of chrome. It degrades the
+ * way every other unreadable page does — `extract()` returns null, the tool reports an
+ * honest failure, and the loop continues with the pages it did get. That is a trade worth
+ * naming: a rare truncated article against a p95 that every concurrent request pays.
+ */
+const PARSE_BYTE_BUDGET = 250_000;
+
 /** Below this, Readability found chrome rather than an article. See extract(). */
 const MIN_ARTICLE_TOKENS = 120;
 
@@ -160,17 +206,40 @@ async function fetchHtml(url: URL, signal: AbortSignal): Promise<FetchOutcome> {
   return { ok: true, html: html.length > MAX_BYTES ? html.slice(0, MAX_BYTES) : html };
 }
 
+/**
+ * Everything jsdom would build a node for and Readability would then ignore.
+ *
+ * Regex on HTML, deliberately: the alternative is to build the DOM in order to prune it,
+ * which is the cost this exists to avoid. It is safe HERE because it is not parsing — a
+ * missed or over-eager match costs some bytes either way and never produces a node that
+ * lies about the page. Nothing that can carry article text is in the list, and `<template>`
+ * is inert content by definition.
+ */
+const stripNonContent = (html: string): string =>
+  html
+    .replace(/<!--[\s\S]*?-->/g, '')
+    .replace(/<script\b[^>]*>[\s\S]*?<\/script\s*>/gi, '')
+    .replace(/<style\b[^>]*>[\s\S]*?<\/style\s*>/gi, '')
+    .replace(/<noscript\b[^>]*>[\s\S]*?<\/noscript\s*>/gi, '')
+    .replace(/<svg\b[^>]*>[\s\S]*?<\/svg\s*>/gi, '')
+    .replace(/<template\b[^>]*>[\s\S]*?<\/template\s*>/gi, '');
+
 function extract(html: string, url: string): { title: string; text: string } | null {
   // jsdom logs every CSS parse error on a real-world page. Swallow them: they are noise,
   // not signal, and they would drown the one log line per answer that matters.
   const virtualConsole = new VirtualConsole();
   virtualConsole.on('jsdomError', () => {});
 
+  // Both steps happen before a single node exists. See PARSE_BYTE_BUDGET for why this is
+  // the ttft fix and why neither one can change what comes out.
+  const stripped = stripNonContent(html);
+  const source = stripped.length > PARSE_BYTE_BUDGET ? stripped.slice(0, PARSE_BYTE_BUDGET) : stripped;
+
   let dom: JSDOM;
   try {
     // Scripts never run — no `runScripts` option. Parsing a hostile page must not
     // execute it, and this process holds every provider key.
-    dom = new JSDOM(html, { url, virtualConsole });
+    dom = new JSDOM(source, { url, virtualConsole });
   } catch {
     return null;
   }

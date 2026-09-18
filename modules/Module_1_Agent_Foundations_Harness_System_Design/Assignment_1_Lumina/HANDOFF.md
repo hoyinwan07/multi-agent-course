@@ -8,14 +8,18 @@ committed and pushed; nothing is hanging mid-flight. This session's goal from he
 **fast-follow work to improve the failing eval metrics** before the resubmission window
 closes, starting a fresh chat per-topic rather than one long thread.
 
-**State of the submission right now:**
-- Score: **75/100 automated**, 15 manual points open for a grader, **1 red line crossed
-  (A2)** — explained and accepted as an honest trade-off in `DESIGN.md`'s Trade-offs #3,
-  not a bug being hidden.
-- Git: local `main` and `mine/2026-03-hoyinwan/lumina-week1` are identical at `10da115`.
-  Nothing uncommitted except 3 harmless untracked files (see Git state below).
-- Deploy: both Fly apps and Vercel are live and serving the current code + the current
-  `reports/report.json`.
+**State of the submission right now (after fast-follow #1, same day):**
+- Score: **73/85 automated**, down 2 from the 75/85 baseline — same scale, a real (small)
+  drop, not a denominator artifact. Traced to Deep search scoring 13/15 instead of 15/15
+  this run (one of the 4 deep queries hit the 240s/24-call ceiling) — unrelated to fast-
+  follow #1, which is scoped to quick/web queries. See #1 below for what #1 itself did and
+  didn't move. 15 manual points open for a grader, **1 red line crossed (A2)** — explained
+  and accepted as an honest trade-off in `DESIGN.md`'s Trade-offs #3, not a bug being hidden.
+- Git: local `main` and `mine/2026-03-hoyinwan/lumina-week1` are identical at `d600cb7`
+  (fast-follow #1's commit). Nothing uncommitted except 3 harmless untracked files (see Git
+  state below).
+- Deploy: both Fly apps (agent redeployed at v5, gateway redeployed with the fresh report)
+  and Vercel are live and serving the current code + the current `reports/report.json`.
 
 **One diagnostic finding worth knowing before you dig into anything else:** the header's
 health-check dot can show "gateway unreachable" on a page's first load if the gateway
@@ -29,10 +33,38 @@ cosmetic, not a real outage, and `web/` is off-limits to edit — don't chase it
 Real numbers from the last full bench run against the deployed gateway
 (`https://lumina-gateway-hoyinwan.fly.dev`, 2026-09-18):
 
-1. **Error rate 3.7%** (target ≤1%) — 3 of 40 web queries failed, one explicitly "aborted
-   due to timeout." Also `quickBudget` failed separately: **6 of 72 quick runs exceeded
-   $0.05 or 8 tool calls.** Start here — this may share a root cause with #3 (an extra LLM
-   turn from a failed fetch costs both a timeout risk and the latency/cost overage).
+1. **DONE, partially — Error rate / quickBudget.** Root cause found and fixed:
+   `retrieve.ts`'s Phase 1 early-exit required EVERY call in a turn to succeed
+   (`allOk && store.size >= minEvidenceToExit`) before trusting evidence that had already
+   cleared the bar. A single `fetch_page` failure (403/paywall/JS-only — common) forced a
+   whole extra LLM turn even when the other calls in the same turn already had enough.
+   Fixed by dropping `allOk` — Phase 2 never reads raw tool outcomes, only the evidence
+   store, so nothing is lost. Commit `d600cb7`, deployed as agent v5.
+   - **Confirmed working**: a query with 3 successful fetches + 1 403 now exits after 1
+     turn instead of 2 (verified both locally and against a real request in this run,
+     `req_87d8e52f-5e2` aside — see below). The web-query error sub-metric this was aimed
+     at went from **3/40 failing → 40/40 answered, 0 errors** in the post-fix bench run.
+   - **quickBudget did NOT improve this run** (10/75 over budget vs the prior 6/72) — do
+     not read that as the fix failing. Traced every over-budget run in this bench's own
+     Mongo docs (`createdAt >= today`) and none of them are cases the fix targets: they're
+     either (a) a turn whose model request exceeded the remaining call budget, which hits
+     the `dropped > 0 → return 'cap'` branch — that check runs BEFORE the evidence-threshold
+     check and short-circuits it even when evidence is already sufficient (e.g.
+     `req_87d8e52f-5e2`: ended at exactly 8 calls, `cap`, despite reaching 4 evidence items
+     by the end — the *next* thing worth trying, and it overlaps with #6's tool-thrash
+     finding), or (b) runs needing genuinely many real tool calls with zero failures at all
+     (e.g. `req_528531d6-7c4`: 0 fails, still hit 8 calls). Both are workload variance /
+     separate mechanisms, not something this fix could reach.
+   - **The overall automated score didn't move** (73/85 vs 75/100 baseline) because the
+     Performance & SLA bucket is dominated entirely by ttft (30s vs 2.5s target this run) —
+     #3 below. Fixing #1 cannot show up in the score until #3 moves. Error rate's SLA gate
+     also still fails (0.0125 > 0.01), but now **entirely from one deep-search timeout**,
+     not from any web/quick error — the fix's target metric is clean.
+   - **Next step for this thread**: try checking the evidence threshold BEFORE the
+     `dropped > 0` cap check in `retrieve.ts`, so a turn that already has enough evidence
+     exits `done` even when the model asked for more calls than remained. Same shape of
+     fix as today's — verify a few real over-budget requestIds like `req_87d8e52f-5e2`
+     against the new code before trusting it.
 2. **A2 red line crossed** — 47 runs terminated `"cap"` (mostly deep-search sub-questions
    dividing the fixed 24-call budget across 3-7 questions), a few `"error"`. `DESIGN.md`
    Trade-offs #3 argues this is honest, not dishonest, and chooses not to game the rule —

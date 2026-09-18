@@ -19,9 +19,23 @@ every decision from here:**
 > session shaving seconds buys a better product and zero score.
 
 **Fast-follow #4 (the refinement leak) is BUILT and deployed but NOT yet measured at bench
-scale.** The next session's job is to run one full bench and see whether the ~7 points
-moved. Nothing else is worth starting before that number exists — see "Where #4 stands"
-below for exactly what to check and what the probe already showed.
+scale.** The next session's job is exactly one thing: **purge the search cache, run one full
+bench, rebuild the report, redeploy the gateway.** Nothing else is worth starting before
+that number exists. Read, in this order: "BEFORE YOU RUN THE BENCH" (a real measurement
+trap — skip it and the cache number is fake), "Where the real report lives" (the regen
+chain), then "Where #4 stands" for what to expect.
+
+**The four rows to watch, and what would count as #4 working:**
+| row | now | #4 lands if |
+|---|---|---|
+| search cache hit rate | 45% | **≥50%** — needs every repeat to avoid refining |
+| `quickBudget` | 11/75 over | fewer; modelled 63/375 → 60 |
+| quality errors (A2) | 1 error | unchanged by #4; separate problem |
+| deep cap+1 429 | timed out | may pass free on 2 vCPUs — cheapest 2 pts on the board |
+
+If the cache row clears 50%, that is ~7 points and the single biggest recoverable item.
+If it does not, the refinement rate is still above zero — get it from `runs/` for free
+(count `web_search` per run) before changing any code.
 
 Full audit of the earlier fast-follows, with before/after numbers and root causes, is
 written up as an artifact: **https://claude.ai/artifact/H2rjHxKGDpeZeBjjnW2xsh** (predates
@@ -261,6 +275,30 @@ Real numbers from the last full bench run against the deployed gateway
 and the video (part of the 5-pt deploy/docs row) are graded by a human, not fixable by
 code. Video wasn't recorded before submission (explicit call given the deadline); can be
 added for the one allowed resubmission if worth the 5 points.
+
+## BEFORE YOU RUN THE BENCH — purge the search cache
+
+**Purge it first, or the cache number is a lie:**
+
+```bash
+cd backend/agent && npx tsx src/dev/try-cache.ts --purge
+```
+
+Profiling #3 on 2026-09-18 ran eight of the twenty distinct `benchmark/queries.json` web
+queries (RAG, Tavily, Atlas Vector Search, RRF, SSE, BM25, GPAI, SSE-vs-WebSockets) against
+the deployed gateway. `SEARCH_CACHE_TTL_SECONDS` is 21600 (6h), so a bench started inside
+that window finds those eight already cached on its FRESH pass and scores them
+`searchCached: true` — inflating the hit rate for a reason that has nothing to do with the
+code. **This is the exact mechanism that produced the fake 92.5% baseline and the
+"everything is going downhill" reading of 92.5% → 45%.** Do not reproduce it.
+
+Purged, the run measures what the gate is actually defined against: 20 fresh queries that
+all miss, 20 repeats that must all hit, ceiling exactly 50%, gate ≥50%. It passes only if
+**zero repeats refine**. That is the honest, conservative number and the only one worth
+putting on `/evals`.
+
+Purging is safe — it is a cache, the dev script says so, and the only cost is that the
+bench pays for 20 real Tavily searches it would otherwise have got free.
 
 ## Where the real report lives
 - Live: **https://hw-lumina-beta.vercel.app/evals** (renders `GET /evals/report.json` off

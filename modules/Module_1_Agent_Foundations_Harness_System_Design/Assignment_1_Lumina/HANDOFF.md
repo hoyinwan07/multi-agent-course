@@ -4,31 +4,107 @@
 
 **Submitted 2026-09-18.** Live at **https://hw-lumina-beta.vercel.app** — `/` works for a
 stranger, `/evals` renders a real report built from a real deployed run. Everything is
-committed and pushed; nothing is hanging mid-flight. **Next up: fast-follow #3 (ttft/answer
-latency)** — start a fresh chat for it per the per-topic-thread convention.
+committed and pushed; nothing is hanging mid-flight.
 
-Full audit of what's shipped so far, with before/after numbers and root causes, is written
-up as an artifact: **https://claude.ai/artifact/H2rjHxKGDpeZeBjjnW2xsh** — read that before
-this file's priority-list detail if you want the fast version.
+**Fast-follow #3 (ttft/latency) is DONE — and it turned up the thing that should drive
+every decision from here:**
 
-**State of the submission right now (after fast-follows #1, #1b, #2, same day):**
-- Score: **66/85 automated**, down from 75/85 baseline. This is NOT #1/#1b/#2 regressing —
-  each measurably improved its own target metric (see #1/#2 below). The drop is a NEW,
-  separate, NOT-yet-root-caused regression: **search cache hit rate 92.5% → 45%** (target
-  ≥50%), which showed up in the same bench run. Confirmed by diff that neither fix touched
-  the caching layer (`search.tavily.ts`, `repo/searchCache.ts`) — leading hypothesis is
-  Mongo TTL expiry between bench runs (`repo/searchCache.ts` documents the TTL), not
-  confirmed. **This deserves its own look before #3, or right after — it's actively costing
-  more score than #1/#2 combined ever did.**
+> **Further latency work is worth ZERO points.** `eval/build-report.mjs:208` scores the
+> 10-point Performance & SLA row as three equal parts, and the first is
+> `bench.pass === true` — i.e. **every** target in `sla.json` met, all or nothing.
+> `ttft_p95_ms` is 2500 and the measured floor is ~4.7s (0.3s eager + **2.4s Phase-1 LLM
+> turn** + 0.6s fetch + 1.0s synthesis first token, on a warm cache with fast pages), so
+> `bench.pass` can never be true. That makes ttft p95, answer p95, deep plan p95 AND the
+> search-cache-hit-rate target all worth nothing **through that row**. Spending another
+> session shaving seconds buys a better product and zero score.
+
+**Next up: fast-follow #4 — the refinement leak.** It is the highest-value item left and it
+is NOT a caching bug. See "What is actually worth points" below before starting anything.
+
+Full audit of the earlier fast-follows, with before/after numbers and root causes, is
+written up as an artifact: **https://claude.ai/artifact/H2rjHxKGDpeZeBjjnW2xsh** (predates
+#3 — the priority list in this file supersedes it).
+
+**State of the submission right now (after fast-follows #1, #1b, #2, #3a, #3b):**
+- Score: **66/85 automated** as last measured. #3 did not change it and was never going to
+  (see the box above); it will change only if fast-follow #4 lands. The 19 missing points
+  are itemised under "What is actually worth points".
 - 15 manual points open for a grader, **1 red line still crossed (A2)** — see #2 below for
   how much the underlying cap rate moved even though the red line itself is still crossed.
-- Git: local `main` and `mine/2026-03-hoyinwan/lumina-week1` are identical at `bf0bab7`.
-  Nothing uncommitted except 2 harmless untracked stray `package-lock.json` files (see Git
-  state below).
-- Deploy: agent is at Fly release v7 (all three fixes baked in). Gateway was just
-  redeployed with the SECOND bench run's `reports/report.json` — if `/evals`'s
-  `runNotes` doesn't mention "fast-follows #1, #1b, #2", the gateway image is stale; see
-  "Where the real report lives" below for the regen procedure. Vercel unchanged, still live.
+- Git: local `main` is at `f8355a6`; **`mine/2026-03-hoyinwan/lumina-week1` has NOT been
+  pushed since `bf0bab7`** — `634c113` and `f8355a6` are local-only. Push before you rely
+  on the fork being current. Nothing uncommitted except 2 harmless untracked stray
+  `package-lock.json` files (see Git state below).
+- Deploy: agent is at **Fly release v9** (#3a + #3b baked in), and the machine is now
+  **2 shared vCPUs, not 1** (`fly.agent.toml`). Gateway still carries the bench run from
+  before #3 — `/evals` is therefore showing pre-#3 latency numbers, which is correct, since
+  no bench has been run since. Vercel unchanged, still live.
+
+### What fast-follow #3 actually found (root cause, not a tuning pass)
+
+`extract()` in `tools/fetch_page.ts` is the only synchronous CPU-bound step on the request
+path, and the agent is one Node event loop. A jsdom parse does not yield, so it froze
+**every** request in flight, not just its own. The signature, measured against the deployed
+agent at the bench's concurrency of 4: three unrelated requests all emitted their first
+token at the same 23.68s instant, because one of them was parsing a 1.87 MB elastic.co docs
+page (8,610 `<span>` / 7,095 `<li>` / 7,091 `<a>` against 55 `<p>` — the whole docs tree
+inlined into the nav) logged as an 18.2s `fetch_page`.
+
+Two commits, both measured on the same eight queries at concurrency 4:
+
+| | ttft p95 | answer p95 | elastic.co fetch |
+|---|---|---|---|
+| before | 24,590ms | 27,741ms | 18,180ms |
+| `634c113` #3a — strip + 250 KB parse budget | 14,250ms | 17,413ms | 5,613ms |
+| `f8355a6` #3b — agent VM 1 → 2 shared vCPUs | **10,169ms** | **13,634ms** | 3,880ms |
+
+Extracted text is byte-identical on every bench page after #3a (18034 / 8742 / 5509 / 17436
+/ 14151 / 37253 chars), so the grounding haystack did not move — re-check that with
+`npx tsx src/dev/try-fetch-latency.ts` from `backend/agent/` if you ever touch the parse
+path again. The profiler that produced the timelines is not committed; it is ~150 lines of
+SSE-event-timestamping and is quick to rewrite (POST /threads, POST /ask, record the wall
+clock of every `trace`/`sources`/`token`/`done` event, diff consecutive marks — the gaps
+between traces ARE the LLM turns).
+
+### What is actually worth points — the 19 missing automated points, itemised
+
+Read straight off the last report (`reports/report.json`), most valuable first:
+
+1. **~7 pts · Search & cited answers 13/20** — the one failing part is
+   `search cache hit rate 45%` (target ≥50%). **This is not a caching bug, and the
+   hypothesis recorded here before (Mongo TTL expiry) is wrong.** `done.searchCached` is
+   `searchCachedFrom()` in `tools/types.ts:91`: `searches > 0 && searches === searchHits` —
+   true only if **every** search in the run hit the cache. The bench's workload is 20 fresh
+   + 20 repeats and the gate is ≥50%, so the margin is exactly zero: **every one of the 20
+   repeats must report `searchCached: true`.** One model-chosen refinement search on a novel
+   phrase sets the whole run to `false`. Confirmed in a live trace: a repeat whose eager
+   search hit the cache perfectly still reported `cached=false` because round 1's fetches
+   403'd and the model refined to "Nebius acquires Tavily", which had never been searched.
+   **So the cache metric is really a refinement-rate metric**, and the refinement is
+   triggered by first-round `fetch_page` failures — the same root cause as items 2 and 3
+   below. Fix the refinement rate and three rows move together. (Do NOT go looking in
+   `cache/searchCache.ts` or `repo/searchCache.ts`; they are working.)
+2. **~3.3 pts · Performance & SLA, part 2** — `quickBudget`: 11/75 quick runs exceeded
+   $0.05 or 8 tool calls. Same root cause: a second search+fetch round is what pushes a run
+   over. This is fast-follow #1's genuinely unresolved remainder.
+3. **~3.3 pts · Performance & SLA, part 3** — `quality.errors === 0`, currently 1 error
+   (A2) + 2 warnings over 586 run logs. See #2 in the priority list below.
+4. **~3.3 pts · Performance & SLA, part 1** — `bench.pass`. **Unreachable**, see the box at
+   the top. Write it off.
+5. **2 pts · Deep search 13/15** — the deep cap+1 429 probe failed with
+   `The operation was aborted due to timeout`. That is a *timeout*, not a wrong status code,
+   so it may simply be fixed by #3b's extra vCPU. Cheapest 2 points on the board: re-run the
+   bench and look.
+
+The common root cause behind items 1, 2 and 3 is **first-round `fetch_page` failures
+forcing a second search+fetch round**. The obvious lever — eagerly fetching the top search
+hits concurrently with the Phase-1 LLM turn, so round 1 gathers enough evidence to make a
+refinement unnecessary — was scoped but NOT built this session. If you build it, the one
+thing that must not break: **`save_memory` has to keep running**, or the bench's memory row
+(currently a clean 10/10) fails three metrics at once. `benchmark/bench.mjs:736` sends
+"Remember this preference…" as an ordinary quick web query and requires a `save_memory`
+step in the trace, so any change that lets Phase 1 exit without giving the model its turn
+breaks it.
 
 **One diagnostic finding worth knowing before you dig into anything else:** the header's
 health-check dot can show "gateway unreachable" on a page's first load if the gateway
@@ -93,15 +169,22 @@ Real numbers from the last full bench run against the deployed gateway
      turn" pattern as #1's remaining quickBudget failures before assuming a further
      `DEEP_SUB_QUESTIONS_MAX` cut (e.g. to 3) is the next lever, since that trades away
      source-ratio margin (currently 2.75x vs 2.0x required) for less obvious gain.
-3. **START HERE NEXT — ttft p95 24.4s / answer p95 27.7s** (targets 2.5s/12s), measured on
-   the latest bench run (worse than the 13.2s/16.4s cited at the top of this list
-   originally — that number is stale, this is current). The oldest, biggest open problem,
-   unaddressed since Week 1. Local floor was measured at ≈3.6s; the deployed number is
-   7-8x that now. Not yet root-caused whether this is dominated by the Fly↔Atlas
-   cross-region hop, cold connections, or something in the loop itself — worth actually
-   profiling (e.g. time-to-first-byte on the Atlas connection vs the LLM's first-token
-   latency vs the eager recall/search round trip) before assuming it's unfixable. Findings
-   #5 and #6 below (TTFT floor, LLM turns ≈74% of latency) are the starting context.
+3. **DONE — ttft p95 24.4s → 10.2s, answer p95 27.7s → 13.6s.** Root cause was neither the
+   Atlas hop nor the loop: it was the synchronous jsdom parse in `tools/fetch_page.ts`
+   blocking a single-vCPU event loop for every concurrent request at once. Full write-up,
+   numbers and commits in "What fast-follow #3 actually found" at the top of this file.
+   - **Do not spend another session here.** Both remaining targets are out of reach and,
+     more to the point, worth nothing — see the box at the top for why `bench.pass` cannot
+     go true while `ttft_p95_ms` is 2500. The measured floor is ~4.7s.
+   - What is left in the latency budget, if you ever need it for the product rather than
+     the score: the **Phase-1 LLM turn is 2.4-3.7s of every request**, consistently, and is
+     now the single largest component. Overlapping it with an eager fetch of the top search
+     hits is the only structural lever left (~1.5s), and it is the same change that would
+     fix the refinement leak in item 1 of "What is actually worth points" — which is where
+     its real value is. `effort: low`, `thinking: disabled` and prompt caching are already
+     in place in `providers/llm.anthropic.ts`, so there is nothing cheap left in the call
+     itself; the only other idea is routing Phase 1 to a smaller model, which changes what
+     `done.model` means and needs a decision before it is built.
 4. **deep plan p95 ~6.1s** (target 4s) — essentially unchanged by fast-follow #2 (6056ms
    this run vs 6.4s before; fewer sub-questions to plan for didn't move plan latency
    noticeably — makes sense, `PLAN_MAX_TOKENS` caps the SAME ceiling regardless of how many
@@ -288,10 +371,18 @@ Commits, oldest first:
 2. `normalize()` has NO NFKC — matches `benchmark/lib.mjs`.
 3. Longer snippets are safer; 30-token windows.
 4. `res.on('close')`, never `req.on('close')`, in both the agent and the gateway.
-5. TTFT 2500ms is unreachable; floor ≈ 3.6s local (24.4s observed on the current deploy,
-   2026-09-18 post-fast-follow-#2 bench run — this number has moved between runs, always
-   re-check rather than trusting this line).
-6. LLM turns are ~74% of latency, tools ~26%.
+5. TTFT 2500ms is unreachable, and after fast-follow #3 the floor is understood rather than
+   guessed at: ~4.7s deployed, made of ~0.3s eager recall+search, **2.4-3.7s for the
+   Phase-1 LLM turn**, ~0.6s for the parallel fetches and ~1.0s to the synthesis stream's
+   first token. p95 sits at 10.2s because slow pages and refinement rounds land on top of
+   that floor. (Pre-#3 this line read "≈3.6s local / 24.4s deployed" and the gap was
+   unexplained; it was the jsdom parse blocking the event loop.)
+6. LLM turns are ~74% of latency, tools ~26% — still true, and #3 sharpened it: with the
+   parse bounded, the Phase-1 turn alone is 2.4-3.7s of a ~4.7s floor.
+6b. **`fetch_page`'s parse is CPU-bound and exclusive.** Anything added to the request path
+   that parses HTML shares one event loop with every other in-flight request. The agent VM
+   is 2 shared vCPUs for exactly this reason (`fly.agent.toml` says so at the `[[vm]]`
+   block) — do not quietly drop it back to 1.
 7. `RATE_LIMIT_PER_MINUTE` raised from 30 → 300.
 8. `sla.json` cost rates are placeholders (Sonnet 5 is really $2/$10, not $3/$15).
 9. `temperature` is deprecated on Sonnet 5 — don't re-add it.

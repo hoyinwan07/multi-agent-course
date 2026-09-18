@@ -18,8 +18,10 @@ every decision from here:**
 > search-cache-hit-rate target all worth nothing **through that row**. Spending another
 > session shaving seconds buys a better product and zero score.
 
-**Next up: fast-follow #4 — the refinement leak.** It is the highest-value item left and it
-is NOT a caching bug. See "What is actually worth points" below before starting anything.
+**Fast-follow #4 (the refinement leak) is BUILT and deployed but NOT yet measured at bench
+scale.** The next session's job is to run one full bench and see whether the ~7 points
+moved. Nothing else is worth starting before that number exists — see "Where #4 stands"
+below for exactly what to check and what the probe already showed.
 
 Full audit of the earlier fast-follows, with before/after numbers and root causes, is
 written up as an artifact: **https://claude.ai/artifact/H2rjHxKGDpeZeBjjnW2xsh** (predates
@@ -31,13 +33,45 @@ written up as an artifact: **https://claude.ai/artifact/H2rjHxKGDpeZeBjjnW2xsh**
   are itemised under "What is actually worth points".
 - 15 manual points open for a grader, **1 red line still crossed (A2)** — see #2 below for
   how much the underlying cap rate moved even though the red line itself is still crossed.
-- Git: local `main` and `mine/2026-03-hoyinwan/lumina-week1` are identical at `b0e3f5c`.
+- Git: local `main` and `mine/2026-03-hoyinwan/lumina-week1` are identical at `046bce2`.
   Everything is pushed. Nothing uncommitted except 2 harmless untracked stray
   `package-lock.json` files (see Git state below).
-- Deploy: agent is at **Fly release v9** (#3a + #3b baked in), and the machine is now
-  **2 shared vCPUs, not 1** (`fly.agent.toml`). Gateway still carries the bench run from
-  before #3 — `/evals` is therefore showing pre-#3 latency numbers, which is correct, since
-  no bench has been run since. Vercel unchanged, still live.
+- Deploy: agent is at **Fly release v11** (#3a, #3b, #4, #4b all baked in), and the machine
+  is now **2 shared vCPUs, not 1** (`fly.agent.toml`). Gateway still carries the bench run
+  from before #3 — `/evals` is therefore showing pre-#3 numbers, which is correct, since no
+  bench has been run since. Vercel unchanged, still live.
+
+### Where #4 stands — built, probed, NOT bench-measured
+
+Two commits, `c808ead` (denylist) and `046bce2` (reader fallback). They split the problem:
+the list handles the 12 hosts measured refusing us, the fallback handles the ones nobody
+has met yet — which was the whole objection to shipping a hardcoded list.
+
+What a cheap probe showed (12 runs, ~$0.35, not a bench):
+- repeats **4/4 `searchCached`, 0/4 refined** on the 403-prone queries, where the Tavily
+  query used to 403 on investing.com and refine every time.
+- cost per repeat **$0.043-0.048 → $0.031-0.037**.
+
+**What has NOT been shown**: that `search cache hit rate` clears 50% over the real 40-query
+workload, or that `quickBudget` improved. Both need `node benchmark/bench.mjs`. The gate has
+zero margin by construction (20 fresh + 20 repeats, ceiling 50%, gate ≥50%), so it clears
+only if EVERY repeat avoids refining — a 9.9% historical refinement rate was exactly the
+2 runs that made it 45%.
+
+**Also not shown: the reader fallback firing in a live run.** It is unit-tested against four
+really-blocked hosts (50-220ms, 0 markdown links left, 0 broken segments) but the denylist
+removes the 403s that would trigger it, so it has never run end to end. Expect its first
+real exercise when a host that is not on the list starts refusing us. If you want to force
+it, comment out an entry in `blockedHosts.ts` and ask something that surfaces that host.
+
+**The cheap tools built this session, worth reusing before spending $2-3 on a bench:**
+- Refinement rate, free, from existing logs: count `web_search` per run over `runs/*.json`.
+  9.9% (37/375) was the number that predicted the 45% exactly.
+- `npx tsx src/dev/try-fetch-latency.ts` from `backend/agent/` — per-page fetch cost and
+  captured token count. Run it after touching the parse path; the token counts must not move.
+- `npx tsx src/dev/try-cache.ts` — proves the cache layer itself (key, rows, TTL sweep).
+  Worth running FIRST whenever a cache number looks wrong, so you do not re-chase a
+  mechanism that is fine.
 
 ### What fast-follow #3 actually found (root cause, not a tuning pass)
 
@@ -82,7 +116,18 @@ Read straight off the last report (`reports/report.json`), most valuable first:
    **So the cache metric is really a refinement-rate metric**, and the refinement is
    triggered by first-round `fetch_page` failures — the same root cause as items 2 and 3
    below. Fix the refinement rate and three rows move together. (Do NOT go looking in
-   `cache/searchCache.ts` or `repo/searchCache.ts`; they are working.)
+   `cache/searchCache.ts` or `repo/searchCache.ts`; `try-cache.ts` confirms key derivation,
+   181 stored rows and a sweepable TTL index — the mechanism is fine.)
+   - **The 92.5% baseline was never real, and this matters for reading the trend.**
+     `SEARCH_CACHE_TTL_SECONDS` is 21600 (6h), so a bench started within 6 hours of the
+     previous one finds the *fresh* 20 queries already cached from that run and scores
+     37/40. Run it after the TTL lapses and the ceiling is 50% by construction. The
+     75 → 66 drop is that, **not** #1/#1b/#2 regressing anything — nobody should read the
+     run-over-run trend as "every fix makes it worse", because two of those runs were
+     measuring different cache states, not different code.
+   - The measured refinement rate is **9.9%** (37 of 375 quick web runs issue more than one
+     `web_search`). 9.9% × 20 repeats ≈ 2 lost → 18/40 = 45%. That is the observed number
+     exactly, which is what confirms the diagnosis.
 2. **~3.3 pts · Performance & SLA, part 2** — `quickBudget`: 11/75 quick runs exceeded
    $0.05 or 8 tool calls. Same root cause: a second search+fetch round is what pushes a run
    over. This is fast-follow #1's genuinely unresolved remainder.
@@ -96,14 +141,28 @@ Read straight off the last report (`reports/report.json`), most valuable first:
    bench and look.
 
 The common root cause behind items 1, 2 and 3 is **first-round `fetch_page` failures
-forcing a second search+fetch round**. The obvious lever — eagerly fetching the top search
-hits concurrently with the Phase-1 LLM turn, so round 1 gathers enough evidence to make a
-refinement unnecessary — was scoped but NOT built this session. If you build it, the one
-thing that must not break: **`save_memory` has to keep running**, or the bench's memory row
-(currently a clean 10/10) fails three metrics at once. `benchmark/bench.mjs:736` sends
-"Remember this preference…" as an ordinary quick web query and requires a `save_memory`
-step in the trace, so any change that lets Phase 1 exit without giving the model its turn
-breaks it.
+forcing a second search+fetch round**, and fast-follow #4 is the first attempt at it —
+see "Where #4 stands" above. The failure breakdown that drove it, over the 1,685
+`fetch_page` calls in `runs/`:
+
+```
+403         177   <- 65% of failures; #4 targets these
+timeout      68   <- ALREADY FIXED by #3; all 8 sampled URLs now fetch in <3.3s
+no-article   52   <- correct behaviour, NOT fixable: client-rendered pages
+```
+
+Do not re-chase the last two. The `no-article` hosts (geeksforgeeks, khanacademy,
+websocket.org, tigerdata) extract **literally 0-78 tokens** — the article only exists after
+JavaScript runs, which `fetch_page` deliberately never does. There is no
+`MIN_ARTICLE_TOKENS` value that recovers them, and they must never go on the denylist: they
+are not refusing us, and a future JS-capable fetch could read them.
+
+**If the next lever is the remaining one — overlapping the Phase-1 LLM turn with an eager
+fetch of the top hits** (~1.5s, and it would cut refinements further): the one thing that
+must not break is **`save_memory`**. `benchmark/bench.mjs:736` sends "Remember this
+preference…" as an ordinary quick web query and requires a `save_memory` step in the trace,
+so any change that lets Phase 1 exit without giving the model its turn fails three metrics
+at once and takes the memory row from a clean 10/10 to 0.
 
 **One diagnostic finding worth knowing before you dig into anything else:** the header's
 health-check dot can show "gateway unreachable" on a page's first load if the gateway
@@ -382,6 +441,20 @@ Commits, oldest first:
    that parses HTML shares one event loop with every other in-flight request. The agent VM
    is 2 shared vCPUs for exactly this reason (`fly.agent.toml` says so at the `[[vm]]`
    block) — do not quietly drop it back to 1.
+6c. **A page the grader cannot re-fetch is `unverifiable`, not ungrounded.**
+   `bench.mjs:833` computes `citationGrounding` over `checked - unverifiable`, so a citation
+   from a host that 403s the bench is excluded from the denominator entirely. Confirmed the
+   bench's own fetcher (`lumina-bench/0.1`, `bench.mjs:212`) is refused by all six hosts
+   sampled. This is what makes the markdown from the provider's reader safe on exactly the
+   pages `fetch_page`'s header comment 1 rules it out for — see `fetchPageViaExtract`.
+6d. **Phase 2 is handed `item.sentText` verbatim** (`prompts.ts`'s `sourceBlock`), and
+   `truncateToBudget` takes the HEAD. Fine for Readability, which has already discarded the
+   nav. NOT fine for any reader that returns a whole page: head-truncating a Medium article
+   gives the model "Sign up Sign in Sign up Sign in" and no article. The trap is that
+   `select.ts` scores snippets by query terms, so chrome scores zero, **the citation still
+   looks perfect and only the ANSWER is wrong** — nothing automated catches it. Any future
+   extraction path that does not pre-strip navigation needs `budgetNearQuery`, not
+   `truncateToBudget`.
 7. `RATE_LIMIT_PER_MINUTE` raised from 30 → 300.
 8. `sla.json` cost rates are placeholders (Sonnet 5 is really $2/$10, not $3/$15).
 9. `temperature` is deprecated on Sonnet 5 — don't re-add it.

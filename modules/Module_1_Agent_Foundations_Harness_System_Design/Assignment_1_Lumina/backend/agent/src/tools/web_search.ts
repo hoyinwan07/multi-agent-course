@@ -15,9 +15,19 @@
 import { cachedSearch } from '../cache/searchCache.js';
 import { logFor } from '../obs/log.js';
 import { searchProviderName, type SearchHit } from '../providers/search.js';
+import { isBlockedHost } from './blockedHosts.js';
 import type { Tool, ToolContext, ToolResult } from './types.js';
 
 const MAX_RESULTS = 6;
+
+/**
+ * Never hand back a menu this short after filtering. A blocked URL the model tries and
+ * fails on is still better than no URL at all: the failure is honest, it is visible in the
+ * trace, and the model can refine from it. Falling back to the unfiltered hits on a query
+ * whose whole first page is blocked keeps the filter from turning a bad result set into an
+ * empty one — the filter exists to stop wasting fetches, not to veto a search.
+ */
+const MIN_HITS_AFTER_FILTER = 2;
 
 /**
  * Hard ceiling on searches per request: the eager one plus refinements. The prompt asks
@@ -82,7 +92,20 @@ export const webSearch: Tool = {
 
     const via = cached ? 'cache' : searchProviderName();
 
-    if (!hits.length) {
+    // Applied HERE, to the hits on their way to the model, rather than in the provider or
+    // the cache. Two reasons: the cached rows and the fresh ones go through the same path,
+    // so a cache hit and a live search show the same menu; and the cache keeps whatever the
+    // provider said, so editing the list later changes behaviour immediately instead of
+    // waiting out `SEARCH_CACHE_TTL_SECONDS` on every stored row.
+    const usable = usableHits(hits);
+    if (usable.length < hits.length) {
+      logFor(ctx.requestId, ctx.userId).info(
+        { dropped: hits.length - usable.length, kept: usable.length, query },
+        'search hits filtered: hosts that refuse this agent'
+      );
+    }
+
+    if (!usable.length) {
       // A provider that ran and found nothing is a legitimate empty result, not an error.
       // The run continues and, if it stays empty, terminates as `done` with no citations.
       return {
@@ -94,11 +117,31 @@ export const webSearch: Tool = {
 
     return {
       ok: true,
-      observation: renderHits(hits),
-      reason: `searched ${via} for "${query}" — ${hits.length} results`
+      observation: renderHits(usable),
+      reason: `searched ${via} for "${query}" — ${usable.length} results`
     };
   }
 };
+
+/**
+ * Drop the hits pointing at hosts that refuse this agent — unless that would leave the
+ * model with nothing to work from, in which case the original list stands. See
+ * `blockedHosts.ts` for what is on the list and the 403 counts behind it.
+ *
+ * A hit whose `url` will not parse is dropped either way: `fetch_page` would reject it as
+ * "not a valid URL" one tool call later, and a menu item that cannot be read is not a
+ * result.
+ */
+function usableHits(hits: SearchHit[]): SearchHit[] {
+  const kept = hits.filter((h) => {
+    try {
+      return !isBlockedHost(new URL(h.url).hostname);
+    } catch {
+      return false;
+    }
+  });
+  return kept.length >= Math.min(MIN_HITS_AFTER_FILTER, hits.length) ? kept : hits;
+}
 
 function renderHits(hits: SearchHit[]): string {
   const lines = hits.map(

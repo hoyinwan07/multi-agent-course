@@ -12,7 +12,7 @@
  * one back anyway, and a fixed-format UTC ISO string sorts lexicographically in exactly
  * chronological order.
  */
-import { COLLECTIONS, type MessageDoc } from '@lumina/contract';
+import { COLLECTIONS, type DoneEvent, type MessageDoc } from '@lumina/contract';
 import { db } from '../db.js';
 
 type MessageRow = MessageDoc & { _id: string };
@@ -52,4 +52,67 @@ export async function recentMessages(threadId: string, limit: number): Promise<M
     .limit(limit)
     .toArray()) as MessageDoc[];
   return found.reverse();
+}
+
+/**
+ * `GET /stats` (§10.4). Aggregated straight from this collection rather than the empty
+ * `requests` collection TECHSPEC's file tree names alongside `runs`: nothing in this
+ * service ever writes a row there (checked — no `repo/requests.ts` exists and no other
+ * file imports `COLLECTIONS.requests`), so it would only ever report zeros. Every message
+ * row already carries `userId`, and an assistant row's `done` is exactly one answer's
+ * `DoneEvent` — the same tokens/cost/ttft/searchCached figures the client was told — so
+ * this collection alone is a complete, already-correct source for every field.
+ *
+ * A "request" is a user turn (persisted whether or not it produced an answer — see
+ * `persistExchange` in `http/threads.routes.ts`); an "answer" is an assistant turn (only
+ * ever persisted when one was actually delivered). No index backs `{userId, role,
+ * createdAt}` — `scripts/` is on the do-not-edit list, and a collection scan over one
+ * course's message volume is not worth deviating from "indexes live in scripts/" for.
+ */
+export async function statsForUserSince(userId: string, since: Date): Promise<StatsAggregate> {
+  const rows = await messages();
+  const sinceIso = since.toISOString();
+
+  const [requests, answered] = await Promise.all([
+    rows.countDocuments({ userId, role: 'user', createdAt: { $gte: sinceIso } }),
+    rows
+      .find(
+        { userId, role: 'assistant', createdAt: { $gte: sinceIso } },
+        { projection: { done: 1 } }
+      )
+      .toArray() as Promise<Pick<MessageRow, 'done'>[]>
+  ]);
+
+  const dones = answered.map((a) => a.done).filter((d): d is DoneEvent => Boolean(d));
+
+  return {
+    requests,
+    answers: answered.length,
+    searchCacheHitRatePct: percentOf(dones, (d) => d.searchCached),
+    ttftP95Ms: p95(dones.map((d) => d.ttftMs)),
+    costUsdToday: round2(dones.reduce((sum, d) => sum + d.costUsd, 0)),
+    deepToday: dones.filter((d) => d.depth === 'deep').length
+  };
+}
+
+export type StatsAggregate = {
+  requests: number;
+  answers: number;
+  searchCacheHitRatePct: number;
+  ttftP95Ms: number;
+  costUsdToday: number;
+  deepToday: number;
+};
+
+const percentOf = <T,>(items: T[], pred: (item: T) => boolean): number =>
+  items.length ? Math.round((items.filter(pred).length / items.length) * 1000) / 10 : 0;
+
+const round2 = (n: number): number => Math.round(n * 100) / 100;
+
+/** Nearest-rank p95, same method `benchmark/bench.mjs` scores the SLA with. */
+function p95(values: number[]): number {
+  if (!values.length) return 0;
+  const sorted = [...values].sort((a, b) => a - b);
+  const idx = Math.min(sorted.length - 1, Math.ceil(0.95 * sorted.length) - 1);
+  return sorted[idx]!;
 }

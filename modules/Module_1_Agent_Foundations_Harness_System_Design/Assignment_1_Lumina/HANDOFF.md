@@ -13,8 +13,9 @@ services. React UI + API contract are **provided and must not be edited** (one e
 
 - `backend/gateway/` (:8787) — edge: CORS, `X-User-Id`, request ids, pino, zod, rate limit,
   SSE pass-through, serves `web/dist`. **No provider keys. COMPLETE.**
-- `backend/agent/` (:8000) — the work: loop, tools, memory **done (Week 1)**. RAG, deep search,
-  jobs worker, `/stats` are **Week 2, not started.**
+- `backend/agent/` (:8000) — the work: loop, tools, memory **done (Week 1)**. Spaces, the
+  jobs worker, hybrid retrieval RAG, and `/stats` are **done (Week 2, this session)**. Deep
+  search is the one thing still **not started.**
 
 **Do not edit:** `web/`, `packages/contract/`, `benchmark/`, `eval/`, `quality/`, `scripts/`.
 One exception already made and explained below (`web/vercel.json`). Submission is a
@@ -34,7 +35,7 @@ now runs for real instead of crashing. What's left on the contract:
 
 | Route | Purpose | Status |
 |---|---|---|
-| `GET /stats` | Deep-run cost + remaining daily allowance (needed for the submission video) | 501, not started |
+| `GET /stats` | Deep-run cost + remaining daily allowance (needed for the submission video) | ✅ done |
 | `POST /spaces` | Create a Space | ✅ done |
 | `GET /spaces` | List Spaces | ✅ done |
 | `POST /spaces/:spaceId/documents` | Upload → `202` → parse → chunk → embed → probe → `indexed` (the jobs worker) | ✅ done |
@@ -44,13 +45,15 @@ Deep search itself hangs off the **existing** `POST /threads/:threadId/ask` rout
 `{"depth":"deep"}` — no new route, but the Phase 1 loop needs to plan sub-questions, research
 each, and merge into one citation numbering (README's build-sequence step 8).
 
-**Hybrid retrieval is ALSO done now (same session, second pass)** — see "Done this session,
-part 2" below. `recall@5` went from `0/3` to `3/3` on the smoke bench.
+**Hybrid retrieval is ALSO done (same session, part 2)** — see "Done this session, part 2"
+below. `recall@5` went from `0/3` to `3/3` on the smoke bench.
 
-**What's next, in order:**
-1. `GET /stats` — deep-run cost + `deepDailyCap` remaining, off the `requests`/`runs`
-   collections already populated in Week 1.
-2. Deep search (README step 8): `plan_research` fan-out + merged citation numbering.
+**`GET /stats` is ALSO done (same session, part 3)** — see "Done this session, part 3"
+below. `bench.mjs`'s `statsReconciles` cap passes.
+
+**What's next:** Deep search is the only Week 2 route left (README step 8): `plan_research`
+fan-out + merged citation numbering, behind `DEEP_DAILY_CAP` → 429. Nothing else on the
+contract is still 501.
 
 **Done this session — Spaces + jobs worker (§5.4):**
 - New `repo/` files (the only files touching their collection, per the `repo/` rule):
@@ -117,6 +120,32 @@ delete-a-document (§5.4 lists both as "Could", not "Must").
   point, not yet a real finding. `ttft`/`answer` p95 still miss — the same pre-existing
   Week 1 finding, untouched by this work. `node quality/check.mjs .`: back to 0 errors (same
   2 pre-existing warnings). Typecheck + lint clean throughout.
+
+**Done this session, part 3 — `GET /stats` (§10.4):**
+- **Real finding: the `requests` collection TECHSPEC's file tree pairs with `runs` for this
+  aggregation is never written to** — no `repo/requests.ts` exists and nothing imports
+  `COLLECTIONS.requests`. Rather than build a whole request-logging path Week 1 skipped,
+  `repo/messages.ts` gained `statsForUserSince`, deriving every field from `messages`
+  instead: a `role:'user'` row is a "request" (persisted whether or not it produced an
+  answer — see `persistExchange`), a `role:'assistant'` row is an "answer", and its stored
+  `done` (a full `DoneEvent` — `ttftMs`, `costUsd`, `searchCached`, `depth`) is exactly the
+  per-answer data `/stats` needs, with nothing missing. `runs`/`RunLog` was the other
+  candidate and was rejected: it has no `searchCached` field at all (the contract's `RunLog`
+  doesn't carry it), so it cannot answer `searchCacheHitRatePct`.
+- `http/stats.routes.ts`: `GET /stats`, scoped by `X-User-Id`, windowed to "today" as
+  midnight UTC (matching how `createdAt` is always written — `new Date().toISOString()`).
+  `deepDailyCap` comes from `env.deepDailyCap`, not from data — it's the ceiling, not a
+  measurement. `deepToday` will read `0` until deep search exists, same as TECHSPEC predicts.
+- No new index added for the `{userId, role, createdAt}` query pattern this needs —
+  `scripts/` is on the do-not-edit list, and a collection scan over one course's message
+  volume isn't worth breaking the "indexes live in scripts/indexes.json" convention for.
+  Worth a line in `DESIGN.md` if message volume ever makes this show up in a profile.
+- Verified: a user with 12 prior answers today gets back real, non-zero numbers that match
+  a manual count; a brand-new user id gets all zeros with no crash; no `X-User-Id` still
+  401s; the gateway proxies it unchanged (it was already wired in Week 1). `node
+  benchmark/bench.mjs --smoke`: `statsReconciles` now passes (`/stats.answers=27` against
+  `9` answers that specific run produced). `node quality/check.mjs .`: still 0 errors, same
+  2 pre-existing warnings. Typecheck + lint clean.
 
 Read, in order: `README.md` → `packages/contract/src/http.ts` (spaces/documents schemas) →
 `TECHNICAL.md` (search for the RAG/Spaces and Deep Search sections — build guide, commands,
@@ -293,11 +322,13 @@ index.ts      threadsRouter + memoryRouter mounted BEFORE the 501 loop
 Week 2, added this session: `repo/spaces.ts`, `repo/documents.ts` (+`documentTitles`),
 `repo/chunks.ts` (+`hybridSearchChunks`/RRF), `repo/jobs.ts`, `repo/uploads.ts`,
 `ingest/parse.ts`, `ingest/chunk.ts`, `ingest/index-document.ts`, `http/spaces.routes.ts`,
-`tools/search_documents.ts`, `worker.ts` (rewritten). Touched: `tools/registry.ts`
-(mode/Space-aware `forGear`), `tools/types.ts` (`mode`/`spaceId` on `ToolContext`),
-`loop/retrieve.ts` (router-driven eager calls), `loop/prompts.ts` (mode-parameterized
-system prompt), `loop/run.ts`, `http/threads.routes.ts`. Still to build: `GET /stats`, and
-deep-search planning (`tools/plan_research.ts` already exists but is unregistered/unused).
+`tools/search_documents.ts`, `http/stats.routes.ts`, `worker.ts` (rewritten). Touched:
+`tools/registry.ts` (mode/Space-aware `forGear`), `tools/types.ts` (`mode`/`spaceId` on
+`ToolContext`), `loop/retrieve.ts` (router-driven eager calls), `loop/prompts.ts`
+(mode-parameterized system prompt), `loop/run.ts`, `http/threads.routes.ts`,
+`repo/messages.ts` (+`statsForUserSince`). Still to build: deep-search planning
+(`tools/plan_research.ts` already exists but is unregistered/unused) — the only Week 2
+route left on the contract.
 
 ## Files built (gateway — Week 1, all complete)
 ```
@@ -373,12 +404,12 @@ flyctl deploy -c fly.gateway.toml --ha=false
   finding, the `db()` stale-client bug, and the Vercel per-workspace build gap.
 - **A decision on the cost AND latency gates** — still open, see Known risks.
 - `SERPAPI_API_KEY` — not set locally or on Fly.
-- **Commit the 5 deploy config files** sitting uncommitted right now (see Git state).
-- **Rest of Week 2**: deep search + `/stats`. Spaces, the jobs worker, and hybrid retrieval
-  are all done (this session) — see above.
+- **Rest of Week 2**: deep search only. Spaces, the jobs worker, hybrid retrieval, and
+  `/stats` are all done (this session) — see above. This is genuinely the last route.
 
-**Next session should:** commit this session's work (Spaces + worker + hybrid retrieval —
-see git state below), then build `GET /stats` (cheap — `requests`/`runs` already carry
-everything it needs) and deep search (`plan_research` fan-out + merged citation numbering).
-The ttft/answer p95 misses are the one thing still open from Week 1 and are a separate
-decision (see Known risks), not something either of these blocks on.
+**Next session should:** confirm this session's three commits landed (Spaces+worker,
+hybrid retrieval, `/stats` — see git state below), then build deep search
+(`plan_research` fan-out + merged citation numbering, behind `DEEP_DAILY_CAP` → 429) —
+the only thing left on the contract. The ttft/answer p95 misses are the one thing still
+open from Week 1 and are a separate decision (see Known risks), not something deep search
+blocks on. Redeploy both Fly apps once deep search lands (see Deploy state below).

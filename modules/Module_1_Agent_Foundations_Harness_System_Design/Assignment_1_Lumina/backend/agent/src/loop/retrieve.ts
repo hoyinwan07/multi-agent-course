@@ -15,6 +15,8 @@ import { errorMessage, isProviderError } from '../lib/errors.js';
 import type { Spend } from '../obs/cost.js';
 import type { Log } from '../obs/log.js';
 import type { LlmMessage, LlmProvider } from '../providers/llm.js';
+import { providerCanExtract } from '../providers/search.js';
+import { fetchPageViaExtract } from '../tools/fetch_page.js';
 import * as registry from '../tools/registry.js';
 import type { ToolContext, ToolResult } from '../tools/types.js';
 import type { SseEmitter } from '../http/sse.js';
@@ -262,6 +264,13 @@ export async function retrieve(args: RetrieveArgs): Promise<RetrieveOutcome> {
     const settled = await runBatch(requested, ctx, gear);
     toolCallCount += settled.length;
 
+    // Recover pages this turn was REFUSED, but only if losing them would starve the run.
+    // Runs BEFORE the trace is emitted so a recovered page reports as the one tool call it
+    // always was: the alternative is a second trace step per retry, and `bench.mjs:673`
+    // fails a quick run whose trace exceeds 8 steps, so a fallback that appended steps
+    // would buy evidence by spending the envelope that evidence is measured against.
+    await recoverRefusedFetches({ requested, settled, store, minEvidenceToExit, ctx, log });
+
     // Emitted in the order the model ASKED for them, not the order they finished, so the
     // trace reads as a sequence. Costs a little live-ness; buys a debuggable surface.
     const results = [];
@@ -351,6 +360,118 @@ export async function retrieve(args: RetrieveArgs): Promise<RetrieveOutcome> {
     // trains the model out of calling tools in parallel.
     messages.push({ role: 'tool', results });
   }
+}
+
+/**
+ * A refusal is a 403 and nothing else.
+ *
+ * Deliberately narrow. A timeout is not a refusal — fast-follow #3 showed those were the
+ * event loop blocking, and all eight sampled URLs now fetch in under 3.3s unaided. A page
+ * with no readable article is not a refusal either: geeksforgeeks, khanacademy and the
+ * rest are client-rendered, extract zero tokens, and the provider's reader has no more
+ * chance with them than Readability did. Retrying either would be paying $0.008 to fail a
+ * second time.
+ */
+const isRefusal = (result: ToolResult): boolean => !result.ok && /returned 403\b/.test(result.error);
+
+/**
+ * How many pages one `retrieve()` call may recover through the provider's reader.
+ *
+ * Three is `MIN_EVIDENCE_TO_EXIT`: enough to carry a turn whose every fetch was refused
+ * all the way to the exit threshold, and no budget for a run to keep buying pages after
+ * it already has what it needs.
+ */
+const MAX_RECOVERIES = 3;
+
+type RecoverArgs = {
+  requested: { id: string; name: string; input: Record<string, unknown> }[];
+  settled: Settled[];
+  store: EvidenceStore;
+  minEvidenceToExit: number;
+  ctx: ToolContext;
+  log: Log;
+};
+
+/**
+ * Re-read this turn's REFUSED pages through the search provider's reader — but only when
+ * the turn is going to come up short without them.
+ *
+ * THE GATE IS THE POINT, and it is a measured cost decision rather than a cautious one.
+ * Over the 375 quick web runs in `runs/`, 91 hit a 403 and only 24 of those went on to
+ * refine their search. Recovering all 91 would cost $0.008 each to buy evidence that 67 of
+ * them did not need, and modelling it over the same runs takes `quickBudget` from 63
+ * over-$0.05 to 87. Recovering only the starved ones takes it to 60, because the refinement
+ * it prevents costs $0.0289 — 3.6x the retry. So the condition below is not "was there a
+ * 403", it is "will this turn leave the store short".
+ *
+ * Mutates `settled` in place, before the caller emits its trace, so a recovered page is one
+ * tool call with one trace step whose `reason` names the path it took.
+ */
+async function recoverRefusedFetches(args: RecoverArgs): Promise<void> {
+  const { requested, settled, store, minEvidenceToExit, ctx, log } = args;
+
+  // serpapi has no reader. Checked BEFORE anything is counted: `fetchPageViaExtract` would
+  // throw a ProviderError here, and the increment below would already have billed the run
+  // for a call that was never made.
+  if (!providerCanExtract()) return;
+
+  const refused: number[] = [];
+  // What the store WILL hold once this turn's successes land — the caller adds them after
+  // this returns, so `store.size` alone is one turn behind and would over-trigger.
+  let projected = store.size;
+  for (let i = 0; i < settled.length; i++) {
+    const outcome = settled[i];
+    if (!outcome || outcome.kind !== 'ok') continue;
+    if (outcome.result.ok) projected += outcome.result.evidence?.length ?? 0;
+    else if (isRefusal(outcome.result) && requested[i]?.name === 'fetch_page') refused.push(i);
+  }
+
+  if (!refused.length) return;
+  const short = minEvidenceToExit - projected;
+  if (short <= 0) {
+    // The common case, and the reason this is gated: the run has its evidence, the refused
+    // page was a bonus, and nothing is bought by paying to read it.
+    log.info({ refused: refused.length, projected }, 'refused pages left unread: the turn has enough evidence');
+    return;
+  }
+
+  const targets = refused.slice(0, Math.min(short, MAX_RECOVERIES));
+  const recovered = await Promise.all(
+    targets.map(async (i) => {
+      const url = typeof requested[i]?.input.url === 'string' ? (requested[i]!.input.url as string) : '';
+      if (!url) return { i, result: null };
+      // A billed provider call, counted where every other one is. A recovery that did not
+      // reach `providerCalls` would make a run that paid for four reads report three.
+      ctx.search.providerCalls += 1;
+      try {
+        return { i, result: await fetchPageViaExtract(url, ctx) };
+      } catch (e) {
+        // The reader itself is down. That is not this page's fault and not worth ending a
+        // run over — the original 403 stands and the loop continues with it.
+        log.warn({ err: errorMessage(e), url }, 'page reader failed during recovery');
+        return { i, result: null };
+      }
+    })
+  );
+
+  for (const { i, result } of recovered) {
+    const outcome = settled[i];
+    if (!result || !outcome || outcome.kind !== 'ok') continue;
+    // Replace the refusal with what the reader got — success or its own honest failure.
+    // Nothing is hidden: an unrecovered page keeps a failing result, and a recovered one
+    // says in `reason` which path produced it.
+    settled[i] = { ...outcome, result };
+  }
+
+  log.info(
+    {
+      refused: refused.length,
+      attempted: targets.length,
+      recovered: recovered.filter((r) => r.result?.ok).length,
+      short
+    },
+    'recovered refused pages through the provider reader'
+  );
 }
 
 export type Timed = { result: ToolResult; ms: number };

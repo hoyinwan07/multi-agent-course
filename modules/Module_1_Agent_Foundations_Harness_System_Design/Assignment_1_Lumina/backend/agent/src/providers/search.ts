@@ -60,6 +60,27 @@ export function getSearchProvider(): SearchProvider {
   return chosen;
 }
 
+/** Whether the configured provider offers a page reader at all (serpapi does not). */
+export function providerCanExtract(): boolean {
+  return typeof getSearchProvider().extract === 'function';
+}
+
+/**
+ * Read a page through the provider's own reader.
+ *
+ * The one caller is `fetch_page.ts`'s 403 fallback, and it is a `ProviderError` — not a
+ * tool failure — when the configured provider has no reader: a run that asked for the
+ * fallback on serpapi has hit a configuration gap, and returning "could not read it" would
+ * dress that up as the page's fault.
+ */
+export async function extractViaProvider(url: string, opts?: SearchOptions): Promise<string> {
+  const provider = getSearchProvider();
+  if (!provider.extract) {
+    throw new ProviderError('search', `${provider.name} has no page reader to fall back to`);
+  }
+  return provider.extract(url, opts);
+}
+
 /** What /health reports and what the cache key is salted with. */
 export function searchProviderName(): SearchProviderName {
   return env.searchProvider;

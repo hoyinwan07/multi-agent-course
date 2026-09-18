@@ -29,7 +29,9 @@
 import { Readability } from '@mozilla/readability';
 import { JSDOM, VirtualConsole } from 'jsdom';
 import { evidenceIdForUrl, type EvidenceItem } from '../evidence/store.js';
-import { approxTokens, truncateToBudget } from '../lib/tokens.js';
+import { normalizedTokens } from '../lib/normalize.js';
+import { approxTokens, cutOnWordBoundary, truncateToBudget, type Truncated } from '../lib/tokens.js';
+import { extractViaProvider } from '../providers/search.js';
 import type { Tool, ToolContext, ToolResult } from './types.js';
 
 /**
@@ -167,6 +169,160 @@ export const fetchPage: Tool = {
     };
   }
 };
+
+/**
+ * THE 403 FALLBACK — read a page through the search provider's reader instead of directly.
+ *
+ * Called only by `retrieve.ts`, and only when a turn's direct fetches were refused AND the
+ * evidence store is short of what Phase 1 needs to exit. The gate is the whole design, and
+ * it is a cost decision measured over `runs/`: a Tavily extract is $0.008 at sla.json's
+ * declared rate, and the extra LLM turn that a starved run spends refining its search is
+ * $0.0289 (refined runs mean $0.0674 against $0.0386 for single-search runs). So the
+ * fallback is 3.6x cheaper than the thing it prevents — but only when it prevents it.
+ * Of the 91 quick runs with a 403, only 24 went on to refine; firing on the other 67 would
+ * be paying $0.008 for evidence the run already had. Modelled over the same 375 runs:
+ * on every 403 it takes `quickBudget` from 63 over-budget to 87, gated it takes it to 60.
+ *
+ * WHY THIS IS NOT THE THING `fetch_page`'S HEADER REJECTS. Comment 1 at the top of this
+ * file rules out the provider's reader because it returns markdown, and markdown link
+ * syntax injects tokens the grader's HTML stripper never sees. That reasoning is about
+ * pages the grader can re-fetch. It cannot re-fetch these: `benchmark/bench.mjs:212` uses
+ * its own unadorned user-agent (`lumina-bench/0.1`), and all six hosts sampled refuse it
+ * exactly as they refuse us. `scoreGrounding` counts such a citation `unverifiable` and
+ * `bench.mjs:833` excludes it from the denominator, so on precisely this set the markdown
+ * risk cannot materialise. `markdownToText` below narrows it anyway rather than relying on
+ * that, because a publisher can start serving the grader tomorrow.
+ *
+ * NOT A WAY AROUND ANYBODY'S BLOCK. Our user-agent stays honest and we stop fetching
+ * directly the moment a host refuses. Tavily is a declared commercial crawler with its own
+ * relationship to these publishers; asking it for a page is asking a party that is allowed
+ * to have it, not impersonating a browser.
+ */
+export async function fetchPageViaExtract(url: string, ctx: ToolContext): Promise<ToolResult> {
+  let parsed: URL;
+  try {
+    parsed = new URL(url);
+  } catch {
+    return { ok: false, error: `not a valid URL: ${url}` };
+  }
+
+  let raw: string;
+  try {
+    raw = await extractViaProvider(url, { signal: ctx.signal });
+  } catch (e) {
+    // A page the reader could not get either. Still a TOOL failure, reported as one — the
+    // run continues with what it has, exactly as it would have without the retry.
+    return {
+      ok: false,
+      error: `${url} refused a direct fetch and the provider's reader could not read it either: ${errorText(e)}`,
+      reason: `extract ${parsed.hostname} — reader failed too`
+    };
+  }
+
+  const text = markdownToText(raw);
+  if (approxTokens(text) < MIN_ARTICLE_TOKENS) {
+    return {
+      ok: false,
+      error: `no readable article text extracted from ${url} via the provider's reader`,
+      reason: `extract ${parsed.hostname} — no main content`
+    };
+  }
+
+  const budgeted = budgetNearQuery(text, PAGE_TOKEN_BUDGET, ctx.query);
+  const item: EvidenceItem = {
+    // The SAME id a direct fetch would have minted, so a page read both ways dedupes in
+    // `mergeEvidence` instead of being cited twice under two numbers.
+    id: evidenceIdForUrl(url),
+    kind: 'web',
+    title: parsed.hostname,
+    url,
+    fullText: text,
+    sentText: budgeted.text,
+    segments: budgeted.segments
+  };
+
+  return {
+    ok: true,
+    evidence: [item],
+    observation: [
+      `Read "${item.title}" (${parsed.hostname}) through the search provider's reader,`,
+      `because the site refused a direct fetch.`,
+      `${approxTokens(budgeted.text)} tokens of article text captured${budgeted.truncated ? ' (truncated to the page budget)' : ''}.`,
+      `Preview: ${preview(budgeted.text)}`,
+      'The full text is held for the answer step. Do not quote from this preview.'
+    ].join(' '),
+    // The trace says which path produced the page. A reader of the trajectory must be able
+    // to tell a direct read from a recovered one without reading this file.
+    reason: `fetched ${parsed.hostname} via the provider's reader (direct fetch refused) — ${approxTokens(budgeted.text)} tokens captured`
+  };
+}
+
+/**
+ * Markdown → something an HTML stripper would have produced.
+ *
+ * Only the two constructs that invent tokens: an inline link's target, and an image whose
+ * alt text is not prose the page showed. Everything else markdown does (`#`, `**`) leaves
+ * punctuation that `lib/normalize.ts` collapses anyway, and each extra rule here is another
+ * chance to cut a real sentence in half.
+ */
+const markdownToText = (md: string): string =>
+  md
+    .replace(/!\[[^\]]*\]\([^)]*\)/g, '') //      images: alt text is not page prose
+    .replace(/\[([^\]]*)\]\([^)]*\)/g, '$1') //   links: keep the label, drop the target
+    .replace(/[ \t\u00a0]+/g, ' ')
+    .replace(/[ \t]*\n[ \t]*/g, '\n')
+    .replace(/\n{3,}/g, '\n\n')
+    .trim();
+
+/**
+ * Budget a page to `maxTokens` by keeping the window most about the QUESTION, rather than
+ * the first N tokens.
+ *
+ * `truncateToBudget` takes the head, and for Readability output that is right: Readability
+ * has already thrown the navigation away, so the head of what it returns is the head of the
+ * article. The provider's reader has not — it hands back the whole page as markdown, chrome
+ * included. Measured on the pages this fallback exists for, the first 1,200 tokens of a
+ * Medium article are "Sign up Sign in Sign up Sign in" and the first of a Server Fault page
+ * are its signup terms. Head-truncating those sends Phase 2 a source block of navigation
+ * and no article — and `prompts.ts`'s `sourceBlock` puts `sentText` in front of the model
+ * verbatim, so that is what the answer would be written from.
+ *
+ * Snippet selection would survive it (`evidence/select.ts` scores by query terms, and
+ * "Sign up Sign in" scores zero), which is exactly what makes the bug quiet: the citation
+ * would be fine and the ANSWER would be written from chrome.
+ *
+ * THE SUBSTRING GUARANTEE IS PRESERVED because the result is still ONE contiguous slice of
+ * `fullText` — the same shape `truncateToBudget` returns, just taken from a different
+ * offset. `lib/tokens.ts` warns that stitching the best passages together would cost that
+ * guarantee; this deliberately does not stitch.
+ */
+function budgetNearQuery(fullText: string, maxTokens: number, query: string): Truncated {
+  const budgetChars = maxTokens * 4;
+  if (fullText.length <= budgetChars) return { text: fullText, segments: [fullText], truncated: false };
+
+  const wanted = new Set(normalizedTokens(query).filter((t) => t.length > 2));
+  if (!wanted.size) return truncateToBudget(fullText, maxTokens);
+
+  // Quarter-budget stride: fine enough that the article cannot sit entirely between two
+  // windows, coarse enough that a long page is a handful of scores, not thousands.
+  const stride = Math.max(1, Math.floor(budgetChars / 4));
+  let best = { start: 0, score: -1 };
+  for (let start = 0; start < fullText.length; start += stride) {
+    const slice = fullText.slice(start, start + budgetChars);
+    let score = 0;
+    for (const token of normalizedTokens(slice)) if (wanted.has(token)) score += 1;
+    if (score > best.score) best = { start, score };
+    if (start + budgetChars >= fullText.length) break;
+  }
+
+  // Start on a word boundary too: a window opening mid-word gives the model a fragment and
+  // gives the grader a token that is on no page.
+  const from = best.start === 0 ? 0 : fullText.indexOf(' ', best.start) + 1 || best.start;
+  const window = cutOnWordBoundary(fullText.slice(from, from + budgetChars), budgetChars).trim();
+  return { text: window, segments: [window], truncated: true };
+}
+
+const errorText = (e: unknown): string => (e instanceof Error ? e.message : String(e));
 
 type FetchOutcome = { ok: true; html: string } | { ok: false; error: string };
 

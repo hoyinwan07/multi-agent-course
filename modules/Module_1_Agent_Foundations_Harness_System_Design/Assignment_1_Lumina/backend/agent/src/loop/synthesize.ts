@@ -12,7 +12,7 @@
  * Failure here is a provider failure: it throws, `run.ts` turns it into terminated:"error"
  * and an `error` event. What this function must never do is finish the sentence itself.
  */
-import type { Terminated } from '@lumina/contract';
+import type { SubQuestion, Terminated } from '@lumina/contract';
 import type { CitedSource } from '../evidence/merge.js';
 import type { SseEmitter } from '../http/sse.js';
 import type { Log } from '../obs/log.js';
@@ -32,6 +32,13 @@ import { synthesizeSystemPrompt, synthesizeUserMessage } from './prompts.js';
  * the bound on how badly the prompt can be ignored.
  */
 const ANSWER_MAX_TOKENS = 500;
+
+/**
+ * Deep's structured shape (short answer + a section per sub-question + what's unknown)
+ * genuinely needs more room — the 150-200 word target above is tuned for quick's single
+ * paragraph. `max_cost_per_deep_answer_usd` ($0.35, ~7x quick) has the budget for it.
+ */
+const DEEP_ANSWER_MAX_TOKENS = 2200;
 
 /**
  * A run that hit the retrieval cap still owes the client the honest partial answer the
@@ -68,6 +75,8 @@ export type SynthesizeArgs = {
   memories: string | null;
   /** Whether the model saved something this turn. Changes the empty-retrieval wording. */
   savedMemory: boolean;
+  /** Deep search only: the plan. Switches on the structured shape and the section grouping. */
+  subQuestions?: SubQuestion[];
   llm: LlmProvider;
   ctx: ToolContext;
   sse: SseEmitter;
@@ -85,20 +94,22 @@ export type SynthesizeOutcome = {
 };
 
 export async function synthesize(args: SynthesizeArgs): Promise<SynthesizeOutcome> {
-  const { query, history, cited, terminated, memories, savedMemory, llm, ctx, sse, log, deadline } = args;
+  const { query, history, cited, terminated, memories, savedMemory, subQuestions, llm, ctx, sse, log, deadline } =
+    args;
 
+  const structured = Boolean(subQuestions?.length);
   const guard = new CitationFilter(cited.map((c) => c.source.n));
   const parts: string[] = [];
   let usage = emptyUsage();
 
   const budgetMs = Math.max(deadline - Date.now(), SYNTH_FLOOR_MS);
   const stream = llm.stream({
-    system: synthesizeSystemPrompt(),
+    system: synthesizeSystemPrompt(structured),
     messages: [
       ...history,
-      { role: 'user', text: synthesizeUserMessage({ query, cited, terminated, memories, savedMemory }) }
+      { role: 'user', text: synthesizeUserMessage({ query, cited, terminated, memories, savedMemory, subQuestions }) }
     ],
-    maxTokens: ANSWER_MAX_TOKENS,
+    maxTokens: structured ? DEEP_ANSWER_MAX_TOKENS : ANSWER_MAX_TOKENS,
     // The client hanging up and the run running out of clock are both reasons to stop
     // paying for tokens nobody will read.
     signal: AbortSignal.any([ctx.signal, AbortSignal.timeout(budgetMs)])

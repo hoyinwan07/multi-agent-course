@@ -2,8 +2,44 @@
  * Prompt text. One file because this is the cacheable prefix: byte-identical across
  * requests. Anything per-request belongs in `messages`, never here.
  */
+import type { SubQuestion } from '@lumina/contract';
 import type { CitedSource } from '../evidence/merge.js';
 import type { Gear } from './gear.js';
+
+/**
+ * Deep search's planning call (§5.5): the ONE turn that runs before anything else, with
+ * `plan_research` forced (`loop/deep.ts`). Takes no `Gear` — it is not itself bounded by a
+ * tool-call cap, it produces the plan those caps get divided across.
+ */
+export function planSystemPrompt(min: number, max: number): string {
+  return [
+    'You are the planning stage of a deep research assistant. Your only job is to',
+    `decompose the question into sub-questions that, together, cover it.`,
+    'Call plan_research exactly once with the decomposition — you have no other tool.',
+    '',
+    `HARD REQUIREMENT: the subQuestions array must have AT LEAST ${min} entries and AT`,
+    `MOST ${max}. Not a suggestion — fewer than ${min} will be rejected before this even`,
+    'reaches a reader.',
+    '',
+    'Each sub-question must be independently researchable on its own — worded so it stands',
+    'alone without the original question attached, in one clear sentence — and together',
+    'they should not overlap. Give each one a reason IN AT MOST TEN WORDS: a phrase, not a',
+    'sentence, naming why this angle earns a separate look — not a restatement of the',
+    'sub-question. This call is timed against a tight budget, so terse beats thorough here;',
+    'the thoroughness happens in the research each sub-question gets, not in how it is',
+    'described.',
+    '',
+    'Every sub-question shares ONE fixed research budget, split evenly across however many',
+    `you name, so within the required ${min}-${max} range: lean toward the low end when the`,
+    `question has ${min}-${min + 1} genuinely distinct angles, and only reach toward ${max}`,
+    'when it truly has that many. A thoroughly-researched sub-question beats a thin one —',
+    `but never fewer than ${min}, whatever the question looks like.`,
+    '',
+    'Earlier turns of the conversation may appear before the question, for resolving what a',
+    'pronoun or an implicit subject refers to. Decompose the resolved question, not the',
+    'literal text if it depends on something said earlier.'
+  ].join('\n');
+}
 
 /**
  * Phase 1: retrieval. Tools on, no prose kept.
@@ -152,7 +188,7 @@ export function openingUserMessage(args: OpeningUserMessageArgs): string {
  * would mint a new cache entry per shape of run to say something the structural guard in
  * `citations.ts` enforces anyway.
  */
-export function synthesizeSystemPrompt(): string {
+export function synthesizeSystemPrompt(structured: boolean): string {
   return [
     'You are the synthesis stage of a research assistant. You are given a question and a',
     'numbered set of sources that were just retrieved for it. Write the answer.',
@@ -176,14 +212,32 @@ export function synthesizeSystemPrompt(): string {
     '  one, and never present one as something this request retrieved. A preference cannot',
     '  license a claim the sources do not support.',
     '',
-    'Shape:',
-    '- LENGTH IS A HARD CONSTRAINT: aim for 150 words and never exceed 200. Every word is',
-    '  streamed to a waiting reader, so an answer that runs long is a slow answer, not a',
-    '  thorough one. Two paragraphs is usually right; three is the maximum.',
-    '- Answer the question in the first sentence. Supporting detail after it. Cut anything',
-    '  that is background rather than an answer — an adjacent comparison the question did',
-    '  not ask for is the most common way to overrun.',
-    '- Plain prose. No headings, no preamble, and no talking about "the sources provided".',
+    ...(structured
+      ? [
+          'Shape — this is a DEEP search, and the decomposition is the point (§5.5):',
+          '- Open with a short direct answer, 2-3 sentences, as if that were the whole reply.',
+          '- Then one section per sub-question you were given, each a short heading followed',
+          '  by a paragraph. Skip a section only if that sub-question truly turned up nothing',
+          '  usable — say so in one sentence inside a short "not covered" section, do not just',
+          '  drop it silently.',
+          '- Close with a brief "still unknown" note: what none of the sources answered. Omit',
+          '  it only if the sources genuinely covered everything.',
+          '- Aim for 600-900 words total — roughly 80-120 words per section. A deep answer',
+          '  the same length as a quick one spent the decomposition for nothing, but it is',
+          '  still an answer, not a report; do not pad a section that has little to say.',
+          '- Headings are plain text, not markdown (`Sub-question: …`), matching the rest of',
+          '  this answer\'s plain prose.'
+        ]
+      : [
+          'Shape:',
+          '- LENGTH IS A HARD CONSTRAINT: aim for 150 words and never exceed 200. Every word is',
+          '  streamed to a waiting reader, so an answer that runs long is a slow answer, not a',
+          '  thorough one. Two paragraphs is usually right; three is the maximum.',
+          '- Answer the question in the first sentence. Supporting detail after it. Cut anything',
+          '  that is background rather than an answer — an adjacent comparison the question did',
+          '  not ask for is the most common way to overrun.',
+          '- Plain prose. No headings, no preamble, and no talking about "the sources provided".'
+        ]),
     '- A markdown link is not a citation. Use [n].'
   ].join('\n');
 }
@@ -204,10 +258,12 @@ export type SynthesizeUserMessageArgs = {
   memories: string | null;
   /** True when the model called `save_memory` successfully during retrieval. */
   savedMemory: boolean;
+  /** Deep search only: the plan, so sources can be grouped into a section per sub-question. */
+  subQuestions?: SubQuestion[];
 };
 
 export function synthesizeUserMessage(args: SynthesizeUserMessageArgs): string {
-  const { query, cited, terminated, memories, savedMemory } = args;
+  const { query, cited, terminated, memories, savedMemory, subQuestions } = args;
   // Memories lead, for the same reason they lead in Phase 1: an instruction about how to
   // write has to be read before the thing it governs.
   const head = [...(memories ? [memories, ''] : []), `Question: ${query}`, ''];
@@ -259,21 +315,29 @@ export function synthesizeUserMessage(args: SynthesizeUserMessageArgs): string {
         ]
       : [];
 
-  const blocks = cited.map(({ source, item }) =>
-    [
-      `SOURCE [${source.n}] ${source.title}`,
-      ...(source.url ? [source.url] : []),
-      '"""',
-      item.sentText,
-      '"""'
-    ].join('\n')
-  );
+  const sourceBlock = ({ source, item }: CitedSource): string =>
+    [`SOURCE [${source.n}] ${source.title}`, ...(source.url ? [source.url] : []), '"""', item.sentText, '"""'].join(
+      '\n'
+    );
+
+  // Deep search groups the same sources under the sub-question that found them, so the
+  // model can write the "one section per sub-question" shape the structured prompt asks
+  // for without having to re-derive the grouping itself from `source.subQuestion`.
+  const body = subQuestions?.length
+    ? subQuestions
+        .map((sub) => {
+          const items = cited.filter((c) => c.source.subQuestion === sub.i);
+          if (!items.length) return `SUB-QUESTION ${sub.i}: ${sub.question}\n(no usable source turned up for this one)`;
+          return [`SUB-QUESTION ${sub.i}: ${sub.question}`, items.map(sourceBlock).join('\n\n')].join('\n');
+        })
+        .join('\n\n')
+    : cited.map(sourceBlock).join('\n\n');
 
   return [
     ...head,
     `You may cite ${range}. No other number exists, and any other number will be stripped.`,
     '',
     ...partial,
-    blocks.join('\n\n')
+    body
   ].join('\n');
 }

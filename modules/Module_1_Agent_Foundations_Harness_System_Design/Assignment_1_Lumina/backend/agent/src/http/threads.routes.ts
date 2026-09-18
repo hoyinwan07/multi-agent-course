@@ -23,12 +23,14 @@ import {
   type ThreadDoc,
   type ThreadMessage
 } from '@lumina/contract';
+import { env } from '../env.js';
 import { buildHistory, HISTORY_FETCH } from '../loop/history.js';
 import { run, type RunOutcome } from '../loop/run.js';
+import { nextUtcMidnightIso, startOfUtcDay } from '../lib/time.js';
 import { emptySpend } from '../obs/cost.js';
 import { logFor } from '../obs/log.js';
 import { writeRunLog } from '../obs/runlog.js';
-import { recentMessages, saveMessages } from '../repo/messages.js';
+import { countDeepAnswersToday, recentMessages, saveMessages } from '../repo/messages.js';
 import { findSpace } from '../repo/spaces.js';
 import { findThread, insertThread, listThreads, titleThreadIfUntitled } from '../repo/threads.js';
 import { requireUser } from './auth.js';
@@ -147,13 +149,16 @@ threadsRouter.post('/threads/:threadId/ask', async (req: Request, res: Response)
     return;
   }
 
+  const isDeep = body.data.depth === 'deep';
+
   // One round trip for all of these, because none depends on another and all are needed
-  // before the stream opens. The lookups are what answer 404; the history read would
-  // otherwise add a second Atlas round trip to the TTFT path for nothing.
-  const [thread, priorMessages, space] = await Promise.all([
+  // before the stream opens. The lookups are what answer 404 and 429; the history read
+  // would otherwise add a second Atlas round trip to the TTFT path for nothing.
+  const [thread, priorMessages, space, deepToday] = await Promise.all([
     findThread(threadId.data, userId),
     recentMessages(threadId.data, HISTORY_FETCH),
-    body.data.spaceId ? findSpace(body.data.spaceId, userId) : Promise.resolve(undefined)
+    body.data.spaceId ? findSpace(body.data.spaceId, userId) : Promise.resolve(undefined),
+    isDeep ? countDeepAnswersToday(userId, startOfUtcDay()) : Promise.resolve(0)
   ]);
   if (!thread) {
     res.status(404).json({ error: `no thread ${threadId.data}`, status: 404 });
@@ -163,6 +168,17 @@ threadsRouter.post('/threads/:threadId/ask', async (req: Request, res: Response)
   // same as one that was never named — 404, not a silent fall-through to empty retrieval.
   if (body.data.spaceId && !space) {
     res.status(404).json({ error: `no space ${body.data.spaceId}`, status: 404 });
+    return;
+  }
+  // The spend gate (§5.5), checked BEFORE `sseHeaders()` for the same reason the 404s
+  // above are: once a byte is on the wire the status is 200 forever, and a 429 cannot be
+  // an `error` event inside a stream that already answered 200 to the client's face.
+  if (isDeep && deepToday >= env.deepDailyCap) {
+    res.status(429).json({
+      error: `daily deep-search limit reached (${env.deepDailyCap}/day)`,
+      status: 429,
+      resetsAt: nextUtcMidnightIso()
+    });
     return;
   }
 

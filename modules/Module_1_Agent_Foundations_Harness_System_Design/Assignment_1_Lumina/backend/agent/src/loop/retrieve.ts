@@ -8,7 +8,7 @@
  * Termination here is only ever `done` or `cap`. A provider failure does not return — it
  * throws, and `run.ts` turns that into terminated:"error" and a 502 (§9).
  */
-import type { ToolName } from '@lumina/contract';
+import type { SubQuestion, ToolName } from '@lumina/contract';
 import type { EvidenceItem } from '../evidence/store.js';
 import { EvidenceStore } from '../evidence/store.js';
 import { errorMessage, isProviderError } from '../lib/errors.js';
@@ -36,6 +36,18 @@ const MAX_PARALLEL = 4;
  */
 const MIN_EVIDENCE_TO_EXIT = 3;
 
+/**
+ * Deep search's per-sub-question floor (`loop/deep.ts`). A sub-question's tool-call
+ * budget is a fair fraction of the SAME 24-call ceiling `expectations.json` holds the
+ * whole run log to (recall reserves one call, the rest divides evenly) — at the wide end
+ * of the plan (6 sub-questions) that leaves ~3-4 calls each, one of which is the eager
+ * search. `MIN_EVIDENCE_TO_EXIT`'s 3 assumes quick's roomier 8-call budget; asking a
+ * 3-4-call sub-question for the same three corroborating fetches before it can exit
+ * cleanly guarantees it never does — it is a narrower, more focused question than the
+ * one it was decomposed from, and two solid passages are a reasonable bar for it.
+ */
+const MIN_EVIDENCE_TO_EXIT_SUBQUESTION = 2;
+
 /** What the run log records per call (`RunLog.toolCalls` in the contract). */
 export type ToolCallRecord = { name: ToolName; ok: boolean; error?: string; ms: number };
 
@@ -53,6 +65,8 @@ export type RetrieveOutcome = {
    * the same string.
    */
   memories: string | null;
+  /** Deep search only: the plan. Undefined on a quick run. */
+  subQuestions?: SubQuestion[];
 };
 
 export type RetrieveArgs = {
@@ -82,10 +96,32 @@ export type RetrieveArgs = {
   toolCalls: ToolCallRecord[];
   /** Same reasoning: tokens spent before a failure were still spent, and still billed. */
   spend: Spend;
+  /**
+   * Deep search only (`loop/deep.ts`): tags every trace step and evidence item THIS call
+   * produces with which sub-question it served. Absent on a quick call, so every trace
+   * step and source keeps `subQuestion` unset exactly as today.
+   */
+  subQuestion?: number;
+  /**
+   * Deep search only: skip this call's own eager `recall_memory` and use this value
+   * instead. Recall happens ONCE per deep request, in `loop/deep.ts` — memory is a
+   * request-level "how to write" concern, not something to re-look-up per sub-question,
+   * and re-looking it up would pay for the embedding call once per sub-question for the
+   * same string. `undefined` (the default) means "do the normal eager recall", so a
+   * quick call that never sets this is unaffected; `null` is a legitimate value (recall
+   * ran once, for this user, there was nothing).
+   */
+  presetMemories?: string | null;
 };
 
 export async function retrieve(args: RetrieveArgs): Promise<RetrieveOutcome> {
-  const { query, history, gear, llm, ctx, sse, log, startedAt, toolCalls, spend } = args;
+  const { query, history, gear, llm, ctx, sse, log, startedAt, toolCalls, spend, subQuestion, presetMemories } = args;
+  const skipEagerRecall = presetMemories !== undefined;
+  // Same signal, two meanings: a sub-question call skips its own recall (deep does it
+  // once, up front) AND gets a lower evidence-to-exit bar (see the constant's comment) —
+  // both follow from "this retrieve() call is one slice of a deep run", not two separate
+  // flags to keep in sync.
+  const minEvidenceToExit = subQuestion !== undefined ? MIN_EVIDENCE_TO_EXIT_SUBQUESTION : MIN_EVIDENCE_TO_EXIT;
 
   const store = new EvidenceStore();
   const deadline = deadlineFrom(startedAt, gear);
@@ -127,13 +163,15 @@ export async function retrieve(args: RetrieveArgs): Promise<RetrieveOutcome> {
     ...(wantDocs ? (['search_documents'] as const) : [])
   ];
   const [recalled, ...eagerResults] = await Promise.all([
-    eagerRecall(query, ctx, gear, log),
+    skipEagerRecall ? null : eagerRecall(query, ctx, gear, log),
     ...eagerNames.map((name) => timed(() => registry.run(name, { query }, ctx, gear)))
   ]);
   const eagerByName = new Map(eagerNames.map((name, i) => [name, eagerResults[i]!]));
 
   for (const [name, { result, ms }] of [
-    ['recall_memory', recalled] as const,
+    // `recalled` is null exactly when this call skipped its own eager recall (deep,
+    // sub-question calls) — no trace step for a lookup that never happened.
+    ...(recalled ? ([['recall_memory', recalled]] as const) : []),
     ...eagerNames.map((name) => [name, eagerByName.get(name)!] as const)
   ]) {
     toolCallCount += 1;
@@ -144,17 +182,22 @@ export async function retrieve(args: RetrieveArgs): Promise<RetrieveOutcome> {
       ok: result.ok,
       ms,
       ...(result.reason ? { reason: result.reason } : {}),
-      ...(result.ok ? {} : { error: result.error })
+      ...(result.ok ? {} : { error: result.error }),
+      ...(subQuestion !== undefined ? { subQuestion } : {})
     });
     toolCalls.push({ name, ok: result.ok, ms, ...(result.ok ? {} : { error: result.error }) });
     // A tool that produced evidence eagerly (search_documents) freezes it into the store
     // exactly like a model-called one does — there is no second copy of this logic.
-    if (result.ok && result.evidence?.length) store.add(...result.evidence);
+    if (result.ok && result.evidence?.length) store.add(...tagSubQuestion(result.evidence, subQuestion));
   }
 
   // An empty observation means "this user has nothing stored", which is the normal case and
   // must not put an empty heading in front of every question.
-  const memories = recalled.result.ok && recalled.result.observation ? recalled.result.observation : null;
+  const memories = skipEagerRecall
+    ? (presetMemories ?? null)
+    : recalled?.result.ok && recalled.result.observation
+      ? recalled.result.observation
+      : null;
   const webResult = eagerByName.get('web_search');
   const docsResult = eagerByName.get('search_documents');
 
@@ -234,7 +277,8 @@ export async function retrieve(args: RetrieveArgs): Promise<RetrieveOutcome> {
           input: call.input,
           ok: false,
           ms: outcome.ms,
-          error: errorMessage(outcome.error)
+          error: errorMessage(outcome.error),
+          ...(subQuestion !== undefined ? { subQuestion } : {})
         });
         toolCalls.push({ name, ok: false, error: errorMessage(outcome.error), ms: outcome.ms });
         throw outcome.error;
@@ -248,11 +292,12 @@ export async function retrieve(args: RetrieveArgs): Promise<RetrieveOutcome> {
         ok: r.ok,
         ms: outcome.ms,
         ...(r.reason ? { reason: r.reason } : {}),
-        ...(r.ok ? {} : { error: r.error })
+        ...(r.ok ? {} : { error: r.error }),
+        ...(subQuestion !== undefined ? { subQuestion } : {})
       });
       toolCalls.push({ name, ok: r.ok, ms: outcome.ms, ...(r.ok ? {} : { error: r.error }) });
 
-      if (r.ok && r.evidence?.length) store.add(...r.evidence);
+      if (r.ok && r.evidence?.length) store.add(...tagSubQuestion(r.evidence, subQuestion));
 
       results.push({
         toolCallId: call.id,
@@ -272,7 +317,7 @@ export async function retrieve(args: RetrieveArgs): Promise<RetrieveOutcome> {
     // DONE. `done` is honest — the loop finished on its own terms, it just used a rule
     // instead of a round trip to decide. A turn with any failure never takes this path.
     const allOk = settled.every((s) => s.kind === 'ok' && s.result.ok);
-    if (allOk && store.size >= MIN_EVIDENCE_TO_EXIT) {
+    if (allOk && store.size >= minEvidenceToExit) {
       log.info({ turns, evidence: store.size }, 'phase 1 exited on the evidence threshold');
       return { terminated: 'done', evidence: store.all(), turns, memories };
     }
@@ -284,12 +329,22 @@ export async function retrieve(args: RetrieveArgs): Promise<RetrieveOutcome> {
   }
 }
 
-type Timed = { result: ToolResult; ms: number };
+export type Timed = { result: ToolResult; ms: number };
 
 /** Wall clock around one registry call, so concurrent calls each report their own. */
 async function timed(fn: () => Promise<ToolResult>): Promise<Timed> {
   const t0 = Date.now();
   return { result: await fn(), ms: Date.now() - t0 };
+}
+
+/**
+ * Stamp `subQuestion` onto evidence a call produced. A no-op (returns `items` itself) on
+ * a quick call, where `subQuestion` is `undefined` — so `mergeEvidence`'s dedupe-by-`id`
+ * still sees the exact same objects Week 1 produced, not new ones with an extra key.
+ */
+function tagSubQuestion(items: EvidenceItem[], subQuestion: number | undefined): EvidenceItem[] {
+  if (subQuestion === undefined) return items;
+  return items.map((item) => ({ ...item, subQuestion }));
 }
 
 /**
@@ -309,7 +364,7 @@ async function timed(fn: () => Promise<ToolResult>): Promise<Timed> {
  * tell "this user has nothing stored" from "the recall broke" — which is exactly what the
  * Live Translate precedent says they must be able to do.
  */
-async function eagerRecall(query: string, ctx: ToolContext, gear: Gear, log: Log): Promise<Timed> {
+export async function eagerRecall(query: string, ctx: ToolContext, gear: Gear, log: Log): Promise<Timed> {
   const t0 = Date.now();
   try {
     return { result: await registry.run('recall_memory', { query }, ctx, gear), ms: Date.now() - t0 };

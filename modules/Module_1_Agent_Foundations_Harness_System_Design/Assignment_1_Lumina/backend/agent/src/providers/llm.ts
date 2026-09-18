@@ -60,7 +60,12 @@ export type LlmRequest = {
   signal?: AbortSignal;
 };
 
-export type LlmCompleteRequest = LlmRequest & { tools: LlmToolDef[] };
+export type LlmCompleteRequest = LlmRequest & {
+  tools: LlmToolDef[];
+  /** Force this exact tool. Deep search's planning call is the one user: a decomposition
+   *  the model might not otherwise volunteer a tool call for is not optional here. */
+  toolChoice?: string;
+};
 
 export interface LlmProvider {
   /** What /health names and what the `done` event reports. Never a key. */

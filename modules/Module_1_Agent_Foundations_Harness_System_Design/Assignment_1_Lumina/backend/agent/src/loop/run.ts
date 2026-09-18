@@ -22,6 +22,7 @@ import { logFor } from '../obs/log.js';
 import { getLlmProvider } from '../providers/llm.anthropic.js';
 import type { LlmMessage } from '../providers/llm.js';
 import { newMemoryAccounting, newSearchAccounting, searchCachedFrom, type ToolContext } from '../tools/types.js';
+import { runDeep } from './deep.js';
 import { deadlineFrom, resolveGear } from './gear.js';
 import { retrieve, type ToolCallRecord } from './retrieve.js';
 import { synthesize } from './synthesize.js';
@@ -117,7 +118,10 @@ export async function run(args: RunArgs): Promise<RunOutcome> {
   };
 
   try {
-    const phase1 = await retrieve({ query, history, gear, llm, ctx, sse, log, startedAt, toolCalls, spend });
+    const phase1 =
+      gear.depth === 'deep'
+        ? await runDeep({ query, history, gear, llm, ctx, sse, log, startedAt, toolCalls, spend })
+        : await retrieve({ query, history, gear, llm, ctx, sse, log, startedAt, toolCalls, spend });
 
     terminated = phase1.terminated;
 
@@ -153,6 +157,7 @@ export async function run(args: RunArgs): Promise<RunOutcome> {
       // place by the phase that ran, so this stays true even for a save that landed in a
       // turn the run later abandoned.
       savedMemory: toolCalls.some((c) => c.name === 'save_memory' && c.ok),
+      subQuestions: phase1.subQuestions,
       llm,
       ctx,
       sse,
@@ -191,7 +196,7 @@ export async function run(args: RunArgs): Promise<RunOutcome> {
       searchCached: searchCachedFrom(ctx.search),
       terminated,
       depth: gear.depth,
-      subQuestions: 0
+      subQuestions: phase1.subQuestions?.length ?? 0
     };
     sse.emitDone(done);
   } catch (e) {

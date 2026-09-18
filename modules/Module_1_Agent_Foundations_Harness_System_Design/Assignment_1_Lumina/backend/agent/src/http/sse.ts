@@ -7,6 +7,7 @@
 import type { Response } from 'express';
 import {
   DoneEvent,
+  PlanEvent,
   SourcesEvent,
   StreamErrorEvent,
   TokenEvent,
@@ -46,6 +47,11 @@ export class SseEmitter {
 
   get stepsEmitted(): number {
     return this.step;
+  }
+
+  /** Deep search's real first paint (§5.5): sent before any retrieval starts. */
+  emitPlan(ev: PlanEvent): void {
+    this.write('plan', PlanEvent.parse(ev));
   }
 
   // `subQuestion` is seam 4 (§13): always undefined in Week 1, a real index in Week 2.

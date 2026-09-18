@@ -137,7 +137,8 @@ export class AnthropicProvider implements LlmProvider {
           // are clearly off-target.
           system: toSdkSystem(req.system),
           messages: toSdkMessages(req.messages),
-          tools: toSdkTools(req.tools)
+          tools: toSdkTools(req.tools),
+          ...(req.toolChoice ? { tool_choice: { type: 'tool' as const, name: req.toolChoice } } : {})
         },
         { signal: req.signal }
       );

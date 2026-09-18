@@ -14,6 +14,7 @@
 import { Router, type Request, type Response } from 'express';
 import type { StatsResponse } from '@lumina/contract';
 import { env } from '../env.js';
+import { startOfUtcDay } from '../lib/time.js';
 import { statsForUserSince } from '../repo/messages.js';
 import { requireUser } from './auth.js';
 
@@ -34,8 +35,3 @@ statsRouter.get('/stats', async (req: Request, res: Response) => {
   };
   res.json(body);
 });
-
-const startOfUtcDay = (): Date => {
-  const now = new Date();
-  return new Date(Date.UTC(now.getUTCFullYear(), now.getUTCMonth(), now.getUTCDate()));
-};

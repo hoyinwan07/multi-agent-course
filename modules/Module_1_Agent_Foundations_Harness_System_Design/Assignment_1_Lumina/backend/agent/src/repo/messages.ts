@@ -69,6 +69,21 @@ export async function recentMessages(threadId: string, limit: number): Promise<M
  * createdAt}` — `scripts/` is on the do-not-edit list, and a collection scan over one
  * course's message volume is not worth deviating from "indexes live in scripts/" for.
  */
+/**
+ * The `DEEP_DAILY_CAP` spend gate (§5.5), checked BEFORE a deep run starts — this is the
+ * one query on this collection that runs on the hot path of every deep `ask`, so it stays
+ * a plain count rather than reusing `statsForUserSince`'s full `done`-array fetch.
+ */
+export async function countDeepAnswersToday(userId: string, since: Date): Promise<number> {
+  const rows = await messages();
+  return rows.countDocuments({
+    userId,
+    role: 'assistant',
+    'done.depth': 'deep',
+    createdAt: { $gte: since.toISOString() }
+  });
+}
+
 export async function statsForUserSince(userId: string, since: Date): Promise<StatsAggregate> {
   const rows = await messages();
   const sinceIso = since.toISOString();

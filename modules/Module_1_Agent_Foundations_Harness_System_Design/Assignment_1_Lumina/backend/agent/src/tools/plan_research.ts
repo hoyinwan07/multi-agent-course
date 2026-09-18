@@ -1,27 +1,30 @@
 /**
- * plan_research — DEEP SEARCH ONLY. [W2]
+ * plan_research — DEEP SEARCH ONLY, and never dispatched through `tools/registry.ts`.
  *
- * This file exists in Week 1 so the seam is visible and nothing has to be restructured
- * later. It is deliberately NOT imported by tools/registry.ts, and it must stay that way
- * until deep search is built:
+ * Every other tool is something the model CHOOSES to call, interleaved with others, over
+ * however many turns the loop takes — which is exactly wrong for a decomposition that Must
+ * happen exactly once, first, before any retrieval (§5.5's `plan` event ships before a
+ * single `web_search`/`fetch_page`/`search_documents`). Leaving that ordering to a system
+ * prompt and hoping the model calls this tool before the others is the kind of guarantee
+ * this codebase's own rule calls "a request in a prompt" rather than structural.
  *
- *   - a quick run whose trace contains plan_research has escalated itself into a run that
- *     costs several times more. That is a red line in eval/rubric.json and bench.mjs
- *     checks every quick run for it (AGENTS.md, TECHSPEC §13);
- *   - registering it and relying on `forGear` to filter it would work, but it makes the
- *     red line depend on one boolean staying correct. Not importing it makes the failure
- *     impossible instead of unlikely.
- *
- * Week 2: implement `run`, add it to REGISTRY, and let `Gear.forbiddenTools` keep it away
- * from quick — at which point the filter is the second lock rather than the only one.
+ * So `loop/deep.ts` calls the LLM ONCE, directly, with `tools: [thisToolsDef]` and
+ * `toolChoice: 'plan_research'` forced — before the retrieval loop starts at all — and
+ * reads the decomposition straight out of that one forced tool call. `run()` below is
+ * consequently never invoked by anything: it stays as a tripwire, not a code path. It is
+ * also still deliberately NOT in `tools/registry.ts`'s `REGISTRY` map, for the original
+ * reason — a quick run whose trace contains `plan_research` is a red line in
+ * `eval/rubric.json`, and not registering it makes calling it during the normal turn loop
+ * impossible (an unknown tool name, per `registry.run`) rather than merely forbidden.
  */
+import { env } from '../env.js';
 import type { Tool, ToolContext, ToolResult } from './types.js';
 
 export const planResearch: Tool = {
   name: 'plan_research',
 
   description: [
-    'Decompose the question into 3-6 sub-questions, each with a one-line reason.',
+    `Decompose the question into ${env.deepSubQuestionsMin}-${env.deepSubQuestionsMax} sub-questions, each with a one-line reason.`,
     'Deep search only. Runs before any retrieval.'
   ].join(' '),
 
@@ -30,8 +33,8 @@ export const planResearch: Tool = {
     properties: {
       subQuestions: {
         type: 'array',
-        minItems: 3,
-        maxItems: 6,
+        minItems: env.deepSubQuestionsMin,
+        maxItems: env.deepSubQuestionsMax,
         items: {
           type: 'object',
           properties: {
@@ -48,8 +51,10 @@ export const planResearch: Tool = {
   },
 
   async run(_input: Record<string, unknown>, _ctx: ToolContext): Promise<ToolResult> {
-    // Week 2. Throwing rather than returning a plausible plan: if this is ever reached in
-    // Week 1, the run must fail loudly and visibly, not quietly produce a deep search.
-    throw new Error('plan_research is not implemented in Week 1 and must not be registered');
+    // Unreachable by construction (see header) — never registered, so `registry.run`
+    // answers "unknown tool" before this could ever execute. Throwing rather than
+    // returning a plausible plan is the same "fail loud" reflex as everywhere else: if
+    // this is ever reached, something upstream broke the guarantee, and it must be loud.
+    throw new Error('plan_research has no dispatchable run() — see this file\'s header comment');
   }
 };

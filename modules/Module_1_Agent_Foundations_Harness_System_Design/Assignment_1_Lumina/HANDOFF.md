@@ -1,4 +1,57 @@
-# LUMINA — session handoff (Week 1 SHIPPED + deployed; Week 2 starts here)
+# LUMINA — session handoff (Week 1 shipped; Week 2 code-complete, pending commit)
+
+## READ THIS FIRST — exact resume point
+
+Deep search (README step 8, the last Week 2 route) is **built, fully re-verified against
+the restarted agent, and both open findings from that verification have been reviewed and
+explicitly accepted as documented risks by the user. Nothing is committed yet — that is the
+only remaining step, and it needs the user's go-ahead.**
+
+What happened in the verification pass (2026-09-18 session):
+1. Restarted the agent (old PID killed by exact PID, not `pkill`, per the standing rule
+   below) to pick up the `PLAN_MAX_TOKENS`/prompt fix.
+2. Hand-verified one deep search: plan arrived in ~6.9s (down from the ~10s pre-fix
+   baseline), no `PLAN_MAX_TOKENS` truncation error, decomposition stayed sane (6
+   sub-questions).
+3. Ran the FULL `node benchmark/bench.mjs`. Result: **`deep plan p95` improved from
+   9950ms to 6494ms but still misses its `<= 4000ms` target** — the fix helped
+   (~35-45% faster across all 4 samples: 5447/6494/4833/5580ms) but didn't close the gap.
+   Every other deep-search SLA line passed. **User decision: accept `deep plan p95` as a
+   known, documented risk — do not tune further.** See "Deep search — architecture, bugs
+   found, and verification" below for the full final SLA table.
+4. Ran typecheck (clean) and eslint (clean). `node quality/check.mjs .` came back
+   `1 error(s), 2 warning(s)` instead of the expected `0 errors, 2 warnings` — traced to
+   rule `A2` ("every run ends with `terminated='done'`", severity `error`), which was
+   tripping on `cap`-terminated deep runs now that deep search actually exists in the
+   local `runs/` corpus. Split the runs by whether they predated the agent restart: 3
+   `error`-terminated deep runs turned out to be stale debris from the OLD pre-fix process
+   (10:35-10:41am, before the 11:14:18 restart) — **deleted** (`runs/req_mu728jze.json`,
+   `req_mu72esji.json`, `req_mu72g6z6.json`; all untracked, never committed, safe to
+   remove). The remaining cap-terminated runs (11 deep + 3 quick, all post-restart, all
+   legitimate) are exactly the already-documented "`terminated:'cap'` is common at 6
+   sub-questions" trade-off (see Bug #2 below) plus the pre-existing Week 1 quick-loop
+   finding (see Known risks). **User decision: accept this too — quality/check.mjs will
+   keep showing `1 error(s)` under rule A2 until/unless that rule is rescoped to exclude
+   deep search's accepted cap terminations; this is expected, not a regression to chase.**
+
+**What's left:** commit. The exact uncommitted file list is under "Git / fork state →
+Uncommitted right now" and "Files built (agent...)" below. This project's rule is never to
+commit without being asked, and that has held for every prior piece of this Week 2 work too
+(three separate commits, each only after the user said to) — **ask before committing.**
+
+**Real-money note:** this pass's manual testing plus one full bench run spent somewhere
+around $2-3 in real Anthropic + Tavily calls (each deep search costs ~$0.20-0.25). That's
+expected and within `max_cost_per_deep_answer_usd` ($0.35/answer) — confirmed in the final
+SLA table (`$0.2284` measured). Throwaway test users from this session (`deep-test-1`
+through `-5`, `cap-test-1`, `deep-manual-2`, `deep-manual-3`) have each used part or all of
+their `DEEP_DAILY_CAP` for today (UTC) — irrelevant fake ids, but don't reuse them expecting
+a fresh cap.
+
+Full detail on what was built, the two real bugs found and fixed along the way, and the
+final numbers from the full bench run are under "Deep search — architecture, bugs found,
+and verification" below. The rest of this file (Spaces, hybrid retrieval, `/stats`, deploy
+state) is from earlier in this same session and is committed and stable — no action needed
+there.
 
 ## Working directory
 `modules/Module_1_Agent_Foundations_Harness_System_Design/Assignment_1_Lumina/`
@@ -8,14 +61,14 @@ to it.** Agent commands run from `backend/agent/`, gateway commands from `backen
 
 ## Context
 **Assignment 1: LUMINA**, FDE Agent Engineering Bootcamp cohort 2026-03. Due end of Week 2;
-currently starting **Week 2**. Perplexity-style citation-grounded research agent, two Express
+currently finishing **Week 2**. Perplexity-style citation-grounded research agent, two Express
 services. React UI + API contract are **provided and must not be edited** (one exception below).
 
 - `backend/gateway/` (:8787) — edge: CORS, `X-User-Id`, request ids, pino, zod, rate limit,
   SSE pass-through, serves `web/dist`. **No provider keys. COMPLETE.**
 - `backend/agent/` (:8000) — the work: loop, tools, memory **done (Week 1)**. Spaces, the
-  jobs worker, hybrid retrieval RAG, and `/stats` are **done (Week 2, this session)**. Deep
-  search is the one thing still **not started.**
+  jobs worker, hybrid retrieval RAG, and `/stats` are **done and committed**. Deep search is
+  **built, one fix pending verification, nothing committed yet** — see above.
 
 **Do not edit:** `web/`, `packages/contract/`, `benchmark/`, `eval/`, `quality/`, `scripts/`.
 One exception already made and explained below (`web/vercel.json`). Submission is a
@@ -28,32 +81,24 @@ One exception already made and explained below (`web/vercel.json`). Submission i
 
 ---
 
-## Week 2: what's actually left (start here)
+## Week 2: what's actually left
 
-**Spaces + the jobs worker are DONE this session** (see "Done this session" below) — Gate 2
-now runs for real instead of crashing. What's left on the contract:
+Every route on the contract is now built:
 
 | Route | Purpose | Status |
 |---|---|---|
-| `GET /stats` | Deep-run cost + remaining daily allowance (needed for the submission video) | ✅ done |
-| `POST /spaces` | Create a Space | ✅ done |
-| `GET /spaces` | List Spaces | ✅ done |
-| `POST /spaces/:spaceId/documents` | Upload → `202` → parse → chunk → embed → probe → `indexed` (the jobs worker) | ✅ done |
-| `GET /spaces/:spaceId/documents` | List documents + status | ✅ done |
+| `GET /stats` | Deep-run cost + remaining daily allowance (needed for the submission video) | ✅ done, committed |
+| `POST /spaces` | Create a Space | ✅ done, committed |
+| `GET /spaces` | List Spaces | ✅ done, committed |
+| `POST /spaces/:spaceId/documents` | Upload → `202` → parse → chunk → embed → probe → `indexed` (the jobs worker) | ✅ done, committed |
+| `GET /spaces/:spaceId/documents` | List documents + status | ✅ done, committed |
+| `POST /threads/:id/ask {depth:"deep"}` | Plan sub-questions, fan out, merge citations, spend gate | ✅ built, verifying the last fix, **not committed** |
 
-Deep search itself hangs off the **existing** `POST /threads/:threadId/ask` route via
-`{"depth":"deep"}` — no new route, but the Phase 1 loop needs to plan sub-questions, research
-each, and merge into one citation numbering (README's build-sequence step 8).
-
-**Hybrid retrieval is ALSO done (same session, part 2)** — see "Done this session, part 2"
-below. `recall@5` went from `0/3` to `3/3` on the smoke bench.
-
-**`GET /stats` is ALSO done (same session, part 3)** — see "Done this session, part 3"
-below. `bench.mjs`'s `statsReconciles` cap passes.
-
-**What's next:** Deep search is the only Week 2 route left (README step 8): `plan_research`
-fan-out + merged citation numbering, behind `DEEP_DAILY_CAP` → 429. Nothing else on the
-contract is still 501.
+Hybrid retrieval (`search_documents` + RRF, README step 7) is done and committed alongside
+Spaces/stats — see "Done this session, part 2/3" below. **Nothing is 501 anymore.** Once
+deep search's last fix is verified and committed, Week 2 is code-complete; what remains
+after that is `DESIGN.md` write-ups and the cost/latency finding (see Known risks) —
+neither blocks the contract.
 
 **Done this session — Spaces + jobs worker (§5.4):**
 - New `repo/` files (the only files touching their collection, per the `repo/` rule):
@@ -146,6 +191,133 @@ delete-a-document (§5.4 lists both as "Could", not "Must").
   benchmark/bench.mjs --smoke`: `statsReconciles` now passes (`/stats.answers=27` against
   `9` answers that specific run produced). `node quality/check.mjs .`: still 0 errors, same
   2 pre-existing warnings. Typecheck + lint clean.
+
+**Deep search — architecture, bugs found, and verification (§5.5; BUILT, NOT COMMITTED —
+see "READ THIS FIRST" at the top of this file for the exact resume point):**
+
+*Files.* New: `loop/deep.ts` (the orchestrator), `lib/time.ts` (`startOfUtcDay`/
+`nextUtcMidnightIso`, shared with `/stats`). Modified: `loop/retrieve.ts`, `loop/run.ts`,
+`loop/prompts.ts`, `loop/synthesize.ts`, `providers/llm.ts`, `providers/llm.anthropic.ts`,
+`tools/plan_research.ts`, `http/sse.ts`, `http/threads.routes.ts`, `repo/messages.ts`.
+
+*The architecture decision, and why it isn't what `plan_research.ts`'s old comment said to
+do.* That comment said "register it, let `forGear`/`forbiddenTools` keep it from quick."
+Registering it would make `plan_research` just another tool the model calls whenever it
+feels like during the same turn-loop `retrieve()` already runs — which cannot structurally
+guarantee the Must that matters most here: the `plan` event ships before ANY retrieval.
+That would live in a system prompt's wording, not in the code. Instead: `loop/deep.ts`
+calls the LLM ONCE, directly, with `tools: [planResearch]` and `toolChoice` forced (new
+capability added to `LlmCompleteRequest`/`AnthropicProvider`), before the retrieval loop
+starts at all — then fans out one ordinary `retrieve()` call per sub-question (bounded
+concurrency, `SUBQUESTION_CONCURRENCY = 3`), each tagged with a fixed `subQuestion` index
+passed as a parameter (`retrieve.ts` gained `subQuestion?`/`presetMemories?` on
+`RetrieveArgs`) — never relying on the model to self-report which sub-question a fetch
+several turns later belongs to. `plan_research.ts`'s `run()` is consequently NEVER called
+through the registry; it stays unregistered, and its file header now explains why in
+detail (read it before changing this). Recall runs ONCE per deep request (not once per
+sub-question) via `retrieve.ts`'s newly-exported `eagerRecall`. Each sub-question's
+tool-call budget is a fair fraction of the SAME 24-call ceiling `expectations.json` holds
+the whole run log to (one call reserved for the top-level recall, the rest divided evenly
+and floored — see `loop/deep.ts`'s `RESERVED_FOR_RECALL`/`perSubMax` math).
+
+*Bug #1, real and reproducible: the model does not reliably return `subQuestions` as a
+native array under a FORCED `tool_choice`.* Observed twice, consistently: it serialises
+the whole tool input to a JSON string and nests it one level deeper than the schema
+describes — `{ subQuestions: '{"subQuestions":[...]}' }` instead of
+`{ subQuestions: [...] }`. `input_schema` is a hint to the model, not something the API
+validates the response against. Fixed with `loop/deep.ts`'s `extractSubQuestions()`,
+which handles a native array, a JSON-stringified array, and a JSON-stringified
+re-wrapped object. **If you ever see "0 usable sub-question(s)" again, check this first**
+— log `planCall.input` raw before assuming the model under-decomposed.
+
+*Bug #2: a sub-question's tool-call budget was structurally too tight to ever exit
+cleanly.* With 6 sub-questions, fair division gives each ~3 calls (1 eager search + 2
+more) — but `MIN_EVIDENCE_TO_EXIT` (3, tuned for quick's 8-call budget) requires 3
+successful fetches to auto-exit, which a 3-call budget can never produce (the eager search
+itself produces no evidence, only links). Every sub-question was hitting `cap` by
+construction, not by bad luck. Fixed with a lower `MIN_EVIDENCE_TO_EXIT_SUBQUESTION = 2` in
+`retrieve.ts`, applied automatically whenever `subQuestion` is set — reasoned in-code as
+acceptable because a sub-question is narrower than the question it was decomposed from.
+`terminated: 'cap'` is still common with 6 sub-questions even after this fix (one fetch 403
+anywhere in a 3-call budget has no slack to recover) — this is an honest, expected
+consequence of dividing a fixed budget across a wide plan, not a bug; worth a line in
+`DESIGN.md`, not further tuning.
+
+*The plan prompt was pushed too far once, and it broke a run.* An early version of
+`loop/prompts.ts`'s `planSystemPrompt` said "prefer the low end" of the 3-6 sub-question
+range without also stating the minimum as a hard floor next to it — the model returned
+1 sub-question, which failed the contract's `PlanEvent.min(2)`. Fixed by adding an explicit
+"HARD REQUIREMENT... not a suggestion" line ahead of any guidance about preferring fewer.
+If you touch this prompt again, keep the hard-minimum statement first and unambiguous.
+
+*The `deep plan p95` finding — fully re-verified, now an accepted known risk (not a gap).*
+The full (non-`--smoke`) `node benchmark/bench.mjs` run after both bugs above were fixed,
+**and after the restart + re-test described in "READ THIS FIRST"**, passed EVERY
+deep-specific SLA line except one — this is the FINAL table, measured against the
+restarted agent running the fixed code:
+
+| Metric | Target | Measured |
+|---|---|---|
+| deep answer p95 | ≤ 90s | 51.1s ✓ |
+| deep sub-questions (min) | ≥ 3 | 6 ✓ |
+| deep/quick source ratio (min) | ≥ 2× | 2.0-4.0× across 4 runs ✓ |
+| cost per deep answer | ≤ $0.35 | $0.2284 ✓ |
+| citation grounding | ≥ 0.95 | 1.0 ✓ |
+| error rate | ≤ 0.01 | 0 ✓ |
+| **deep plan p95** | **≤ 4000ms** | **6494ms ✗ (accepted, see below)** |
+
+Full SLA table from the same run, for completeness (the two `✗` rows below are pre-existing
+Week 1 findings, unrelated to deep search — see "Known risks carried forward"):
+`ttft p95` 12303ms (target ≤2500ms, ✗ pre-existing), `answer p95` 16566ms (target
+≤12000ms, ✗ pre-existing), `202 accept p95` 280ms ✓, `search p95 during ingest/idle` 1.198×
+✓, `recall@5` 0.933 ✓, `search cache hit rate` 97.5% ✓, `cost per answer (quick)` $0.0327 ✓,
+`sources before first token` 1 ✓, `citations with no matching source` 0 ✓.
+
+Also verified by hand (not part of the automated SLA table): `deepCap429` — a fresh
+throwaway user hitting `DEEP_DAILY_CAP` gets `429 {error, resetsAt}` with `resetsAt` a real
+midnight-UTC ISO string; every trace step and source in a deep run carries the right
+`subQuestion`; `mode:'web'` deep search still blends correctly; the synthesis prompt's
+structured shape (short direct answer, one section per sub-question, a closing
+"still unknown" note) reads as intended in the one full answer inspected end to end.
+
+The `deep plan p95` miss is a generation-time problem, not a network one: with no
+`maxTokens` set on the planning call, the model was writing verbose sub-questions and
+one-paragraph reasons, and 6 of those at Sonnet's generation speed is genuinely several
+seconds. Three changes went in together and **have now been re-tested and confirmed
+working as intended**, just not sufficient to close the gap to the target:
+1. `loop/deep.ts` gained `PLAN_MAX_TOKENS = 900` on the planning call (previously
+   unbounded at the SDK default of 1536) — a safety ceiling, not the primary fix, sized
+   with headroom so a compliant model's output shouldn't get cut off mid-JSON. **Confirmed:
+   zero `PLAN_MAX_TOKENS` truncation errors across the hand-verification run or the 4 deep
+   answers in the full bench run.**
+2. `planSystemPrompt` now says reasons must be "AT MOST TEN WORDS: a phrase, not a
+   sentence" and explicitly tells the model this call is timed — the real fix, since it
+   should reduce how much the model actually writes rather than just capping it.
+   **Confirmed working directionally** — plan times across the 4 bench samples were
+   5447/6494/4833/5580ms, a ~35-45% improvement over the pre-fix 9950ms baseline — but not
+   enough to land under 4000ms on any of the 4 samples.
+3. Defensively, `loop/deep.ts` now checks `planReply.stopReason === 'max_tokens'` and
+   throws a specific, readable error naming `PLAN_MAX_TOKENS` if a plan ever IS truncated
+   — so that failure mode is diagnosable rather than reappearing as a confusing "0 usable
+   sub-questions" (which is bug #1's signature, not this one's). **Never fired in this
+   verification pass.**
+
+**`deep plan p95` (6494ms vs. the 4000ms target) is now a known, documented risk, not an
+open bug — explicit user decision, do not tune further without being asked.** The
+remaining gap looks like an inherent cost of asking Sonnet to both decompose into 3-6
+sub-questions AND write a reason for each under a forced tool call; shrinking it further
+would likely mean cutting sub-question count or dropping the reason field entirely, both of
+which trade away things the contract or the UX wants. Worth a line in `DESIGN.md` under
+Trade-offs, written by hand (see "What I still owe").
+
+*A second, related finding from this same verification pass: `quality/check.mjs`'s `A2`
+rule ("every run ends with `terminated='done'`", severity `error`) now fails locally,
+because deep search's own accepted cap-termination trade-off (below) started showing up as
+real entries in the `runs/` corpus once deep search was actually exercised. This is not a
+new bug — it is the SAME trade-off as Bug #2 below, just visible through a different gate.
+**Also accepted as a known risk by explicit user decision.** 3 unrelated stale
+`error`-terminated run files from the pre-fix process were found and deleted in the same
+pass (see "READ THIS FIRST") — those were real debris, not part of this trade-off.
 
 Read, in order: `README.md` → `packages/contract/src/http.ts` (spaces/documents schemas) →
 `TECHNICAL.md` (search for the RAG/Spaces and Deep Search sections — build guide, commands,
@@ -249,21 +421,27 @@ the instructor's shared repo; nothing here should ever land on its `main`. All w
 - **`mine`** remote → `https://github.com/hoyinwan07/multi-agent-course.git` (your own fork)
 - Branch: **`2026-03-hoyinwan/lumina-week1`** — this is what Vercel's Production Branch is set to,
   and what the eval/deploy work in this handoff assumes is current.
-- Local `main` and `mine/2026-03-hoyinwan/lumina-week1` are in sync as of commit `575fdc3`,
-  plus whatever this session commits on top (see "Done this session" above).
-- Local `main` is **ahead of `origin/main` by 3 commits, behind by 14** — this is expected and
-  fine; we deliberately never touch `origin`.
+- **Local `main` is at `8d7870e` — THREE commits ahead of `mine/2026-03-hoyinwan/lumina-week1`,
+  which is still at `575fdc3`. Nobody has pushed this session's work yet.** Push (or ask
+  before pushing, per this project's own rule about not doing risky/one-way actions
+  unprompted) once the deep-search commit lands on top, so all four land on `mine` together
+  — or push sooner if the user wants the Spaces/RAG/stats work backed up independently.
+- Local `main` is **ahead of `origin/main` by 6 commits, behind by 14** — expected and fine;
+  we deliberately never touch `origin`.
 
-Commits so far:
+Commits so far, oldest first:
 - `897736c` — Week 1 build (steps 1-11): loop, tools, gateway, memory. 58 files.
 - `9188f0c` — removed the invalid `_comment` from `web/vercel.json`.
-- `575fdc3` — Fly deploy config (agent private, gateway public) + Week 2 handoff. Includes
-  `.dockerignore`, both Dockerfiles, `fly.agent.toml`, `fly.gateway.toml` — these are
-  committed; an earlier version of this section calling them "uncommitted" was stale.
-- Spaces + jobs worker (this session) — see the commit this session made, listed at the top
-  of the file once committed.
+- `575fdc3` — Fly deploy config (agent private, gateway public) + Week 2 handoff.
+- `5c6be0f` — Spaces + upload/list documents + the jobs worker.
+- `59e63ab` — hybrid retrieval (`search_documents` + RRF), wired into the router.
+- `8d7870e` — `GET /stats`.
+- *(not yet made)* — deep search, once the pending fix above is verified and the user says
+  to commit.
 
 **Uncommitted right now** (`git status` at the `multi-agent-course` repo root):
+- All of deep search — see the file list under "Deep search" above. **Do not commit until
+  the pending `PLAN_MAX_TOKENS`/prompt fix is re-tested** (see "READ THIS FIRST").
 - `modules/Module_1_Agent_Foundations_Harness_System_Design/package-lock.json` and
   `multi-agent-course/package-lock.json` — stray, empty, pre-date this work (from Sep 11,
   unrelated npm invocations at the wrong directory level). Leave untracked; not part of LUMINA.
@@ -319,16 +497,25 @@ dev/          try-tool.ts  check-grounding.ts  try-citations.ts  try-cache.ts  t
               try-memory.ts
 index.ts      threadsRouter + memoryRouter mounted BEFORE the 501 loop
 ```
-Week 2, added this session: `repo/spaces.ts`, `repo/documents.ts` (+`documentTitles`),
+Week 2, committed: `repo/spaces.ts`, `repo/documents.ts` (+`documentTitles`),
 `repo/chunks.ts` (+`hybridSearchChunks`/RRF), `repo/jobs.ts`, `repo/uploads.ts`,
 `ingest/parse.ts`, `ingest/chunk.ts`, `ingest/index-document.ts`, `http/spaces.routes.ts`,
-`tools/search_documents.ts`, `http/stats.routes.ts`, `worker.ts` (rewritten). Touched:
+`tools/search_documents.ts`, `http/stats.routes.ts`, `worker.ts` (rewritten),
 `tools/registry.ts` (mode/Space-aware `forGear`), `tools/types.ts` (`mode`/`spaceId` on
-`ToolContext`), `loop/retrieve.ts` (router-driven eager calls), `loop/prompts.ts`
-(mode-parameterized system prompt), `loop/run.ts`, `http/threads.routes.ts`,
-`repo/messages.ts` (+`statsForUserSince`). Still to build: deep-search planning
-(`tools/plan_research.ts` already exists but is unregistered/unused) — the only Week 2
-route left on the contract.
+`ToolContext`), `loop/retrieve.ts` (router-driven eager calls — further extended by deep
+search below, uncommitted), `loop/prompts.ts` (mode-parameterized system prompt — also
+further extended below), `loop/run.ts`, `http/threads.routes.ts`, `repo/messages.ts`
+(+`statsForUserSince`).
+
+Week 2, built but **UNCOMMITTED** (deep search — see "READ THIS FIRST" up top before
+touching any of these): new `loop/deep.ts`, `lib/time.ts`; further changes on top of the
+committed state in `loop/retrieve.ts` (`subQuestion`/`presetMemories` params),
+`loop/prompts.ts` (`planSystemPrompt`, structured synthesis prompt), `loop/run.ts`
+(branches to `runDeep`), `loop/synthesize.ts` (structured shape), `providers/llm.ts` +
+`providers/llm.anthropic.ts` (`toolChoice`), `tools/plan_research.ts` (header rewritten,
+still unregistered — by design now, not by not-built-yet), `http/sse.ts` (`emitPlan`),
+`http/threads.routes.ts` (`DEEP_DAILY_CAP` 429 check), `repo/messages.ts`
+(+`countDeepAnswersToday`). Every route on the contract is now built.
 
 ## Files built (gateway — Week 1, all complete)
 ```
@@ -348,10 +535,21 @@ npm run -w @lumina/agent typecheck && npx eslint backend/agent/src --max-warning
 cd backend/agent && nohup npx tsx src/index.ts > /tmp/lumina-agent.log 2>&1 &   # then sleep 6
 cd backend/gateway && nohup npx tsx src/index.ts > /tmp/lumina-gateway.log 2>&1 &   # then sleep 6
 VITE_API_URL=http://localhost:8787 npm run dev -w web                # → http://localhost:5173
-node quality/check.mjs .                                      # 0 errors; exit 1 is the FLOOR
-node eval/eval.mjs                                             # stops at Gate 2 until /spaces exists
-node benchmark/bench.mjs --smoke                                # same Gate-2 crash, same reason
+node quality/check.mjs .                                      # 0 errors is the FLOOR
+node eval/eval.mjs                                             # all 6 gates now run for real
+node benchmark/bench.mjs --smoke                                # Gate 2's quick check; no deep phase
+node benchmark/bench.mjs                                       # FULL run — the only one that exercises deep search (phase 4) and the daily-cap probe; ~10-15 real min + real API spend
 ```
+
+Manual deep-search smoke test (used to verify the pending `deep plan p95` fix — swap in a
+fresh `x-user-id` each time so `DEEP_DAILY_CAP` doesn't need to reset):
+```bash
+TID=$(curl -s -X POST localhost:8000/threads -H 'x-user-id: deep-manual-1' -H 'content-type: application/json' -d '{}' | node -e "process.stdin.on('data',d=>process.stdout.write(JSON.parse(d).threadId))")
+curl -sN -X POST "localhost:8000/threads/$TID/ask" -H 'x-user-id: deep-manual-1' -H 'content-type: application/json' \
+  -d '{"query":"Should we move our RAG stack off Atlas Vector Search onto a dedicated vector DB? Consider cost at scale, page-level citation support, operational burden of a second store, and migration cost.","mode":"web","depth":"deep"}'
+```
+Watch for: the `plan` event's arrival time (should be well under the ~8-10s seen before
+the fix), no `error` event mentioning `PLAN_MAX_TOKENS`, and a sane 3-6-item decomposition.
 
 Fly redeploys (from the assignment root):
 ```bash
@@ -391,6 +589,16 @@ flyctl deploy -c fly.gateway.toml --ha=false
   repeats.
 - Atlas Search indexes are eventually consistent — acceptable for Week 1 memory recall,
   becomes a hard requirement for Week 2's read-your-write probe (SPEC §13) once Spaces exist.
+- **`deep plan p95` misses its `<= 4000ms` target (measured 6494ms)** — the `PLAN_MAX_TOKENS`
+  + shortened-reason-prompt fix improved it ~35-45% from a 9950ms baseline but didn't close
+  the gap. Explicit user decision (2026-09-18): accept as a known risk, do not tune further.
+  Likely an inherent cost of forcing a 3-6-item decomposition-with-reasons under a forced
+  tool call at Sonnet's generation speed.
+- **`quality/check.mjs` rule `A2` ("every run ends `terminated='done'`") now fails locally**
+  with `1 error(s)`, because deep search's accepted `terminated:'cap'` trade-off (see Bug #2
+  under Deep search below) now shows up as real entries in the local `runs/` corpus.
+  Explicit user decision (2026-09-18): accept this too, same trade-off as the line above,
+  just visible through a different gate. Not tracked as a regression to fix.
 
 ## What I still owe
 - **`DESIGN.md`** — still the largest debt, graded as the design section of `/evals`. Owes:
@@ -401,15 +609,26 @@ flyctl deploy -c fly.gateway.toml --ha=false
   decisions, the `res`-vs-`req` close finding (agent AND gateway), gateway overhead, 404-vs-400,
   502-is-the-only-minted-status, `/evals/report.json` off disk — **and now, from this session:**
   the `flyctl deploy` public-IP re-provisioning gotcha, the 6PN-never-wakes-a-stopped-machine
-  finding, the `db()` stale-client bug, and the Vercel per-workspace build gap.
+  finding, the `db()` stale-client bug, the Vercel per-workspace build gap, the `requests`
+  collection never being written (§10.4, `/stats` derives from `messages` instead), and —
+  once deep search is committed — the fan-out-over-model-self-tagging decision, the two
+  real bugs (forced-`tool_choice` JSON-string double-wrapping, the too-tight per-sub-question
+  budget), and the fixed-24-call-budget-vs-wide-plan trade-off (`terminated:'cap'` being
+  common at 6 sub-questions is a consequence of that trade-off, not a bug).
 - **A decision on the cost AND latency gates** — still open, see Known risks.
 - `SERPAPI_API_KEY` — not set locally or on Fly.
-- **Rest of Week 2**: deep search only. Spaces, the jobs worker, hybrid retrieval, and
-  `/stats` are all done (this session) — see above. This is genuinely the last route.
+- **Deep search is fully verified and both open findings (`deep plan p95`, the `A2` quality
+  gate) are accepted known risks — the ONLY thing left is committing**, and that needs the
+  user's go-ahead first (never commit without being asked — see "READ THIS FIRST").
+- Push this session's commits to `mine/2026-03-hoyinwan/lumina-week1` (currently 3-4
+  commits behind local `main` — see Git state) — not done automatically, ask first.
+- Redeploy both Fly apps once deep search is committed (nothing has been redeployed since
+  the thin Week-1-only deploy — see Deploy state).
 
-**Next session should:** confirm this session's three commits landed (Spaces+worker,
-hybrid retrieval, `/stats` — see git state below), then build deep search
-(`plan_research` fan-out + merged citation numbering, behind `DEEP_DAILY_CAP` → 429) —
-the only thing left on the contract. The ttft/answer p95 misses are the one thing still
-open from Week 1 and are a separate decision (see Known risks), not something deep search
-blocks on. Redeploy both Fly apps once deep search lands (see Deploy state below).
+**Next session should:** if deep search still isn't committed, ask the user and commit it
+(everything is verified — see "READ THIS FIRST"). After that, Week 2 is code-complete and
+what's left is `DESIGN.md` write-ups (see "What I still owe" above — now substantial,
+including the two newly-accepted known risks from this verification pass), the still-open
+cost/latency decision (Known risks), and redeploying. The ttft/answer p95 misses are a
+separate, pre-existing Week 1 decision — not something deep search blocks on or was ever
+expected to fix.

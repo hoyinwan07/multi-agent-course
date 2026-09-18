@@ -7,7 +7,8 @@ web/dist
 .env.*
 !.env.example
 runs
-reports
+reports/*
+!reports/report.json
 *.log
 .git
 .DS_Store

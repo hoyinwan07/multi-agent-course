@@ -22,6 +22,7 @@ COPY --from=build /app/node_modules ./node_modules
 COPY --from=build /app/package.json ./package.json
 COPY --from=build /app/packages/contract ./packages/contract
 COPY --from=build /app/backend/gateway ./backend/gateway
+COPY reports/report.json ./reports/report.json
 
 # The app resolves .env / web/dist / reports relative to process.cwd() assuming
 # it runs from backend/gateway/ (as it does in local dev) — match that here.

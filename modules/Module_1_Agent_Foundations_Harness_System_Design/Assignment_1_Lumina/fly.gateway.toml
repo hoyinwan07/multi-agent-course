@@ -12,7 +12,7 @@ primary_region = 'iad'
 [env]
   PORT_GATEWAY = '8787'
   AGENT_URL = 'http://lumina-agent-hoyinwan.internal:8000'
-  CORS_ORIGINS = 'http://localhost:5173,https://multi-agent-course-rho.vercel.app'
+  CORS_ORIGINS = 'http://localhost:5173,https://hw-lumina-beta.vercel.app'
   RATE_LIMIT_PER_MINUTE = '300'
   LOG_LEVEL = 'info'
 

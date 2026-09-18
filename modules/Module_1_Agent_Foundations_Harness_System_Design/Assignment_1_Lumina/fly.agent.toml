@@ -23,8 +23,20 @@ primary_region = 'iad'
   min_machines_running = 1
   processes = ['app']
 
+# Two vCPUs, not one, and the reason is measured rather than precautionary.
+#
+# `tools/fetch_page.ts` runs a synchronous jsdom parse per page, and this service is one
+# Node event loop: on a single vCPU that parse is not just slow, it is exclusive — it
+# blocks every other in-flight request's timers, sockets and SSE writes. Bounding the
+# parse (see PARSE_BYTE_BUDGET) fixed the pathological case; what is left is ordinary
+# contention, and it is large. Measured 2026-09-18 against this app: the same elastic.co
+# page parses in 1,758ms served alone and 5,613ms at the bench's concurrency of 4 — a 3.2x
+# tax that lands on ttft and answer p95 together, because the bench runs four at a time.
+#
+# The second slice is what the workload is actually short of. Raising `memory` would not
+# help: peak RSS on a 1200-token page budget is nowhere near 1 GB.
 [[vm]]
   memory = '1gb'
   cpu_kind = 'shared'
-  cpus = 1
+  cpus = 2
   memory_mb = 1024

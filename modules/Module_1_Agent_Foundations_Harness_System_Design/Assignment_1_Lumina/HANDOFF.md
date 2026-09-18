@@ -29,27 +29,61 @@ One exception already made and explained below (`web/vercel.json`). Submission i
 
 ## Week 2: what's actually left (start here)
 
-Contract routes still returning `501` (`backend/agent/src/index.ts` registers a catch-all
-`notImplemented` for every route in `packages/contract/src/http.ts` not explicitly wired):
+**Spaces + the jobs worker are DONE this session** (see "Done this session" below) — Gate 2
+now runs for real instead of crashing. What's left on the contract:
 
-| Route | Purpose |
-|---|---|
-| `GET /stats` | Deep-run cost + remaining daily allowance (needed for the submission video) |
-| `POST /spaces` | Create a Space |
-| `GET /spaces` | List Spaces |
-| `POST /spaces/:spaceId/documents` | Upload → `202` → parse → chunk → embed → probe → `indexed` (the jobs worker) |
-| `GET /spaces/:spaceId/documents` | List documents + status |
+| Route | Purpose | Status |
+|---|---|---|
+| `GET /stats` | Deep-run cost + remaining daily allowance (needed for the submission video) | 501, not started |
+| `POST /spaces` | Create a Space | ✅ done |
+| `GET /spaces` | List Spaces | ✅ done |
+| `POST /spaces/:spaceId/documents` | Upload → `202` → parse → chunk → embed → probe → `indexed` (the jobs worker) | ✅ done |
+| `GET /spaces/:spaceId/documents` | List documents + status | ✅ done |
 
 Deep search itself hangs off the **existing** `POST /threads/:threadId/ask` route via
 `{"depth":"deep"}` — no new route, but the Phase 1 loop needs to plan sub-questions, research
 each, and merge into one citation numbering (README's build-sequence step 8).
 
-**Why this blocks everything else right now:** `node eval/eval.mjs` (all six gates) and
-`node benchmark/bench.mjs` both crash at Gate 2 with `HttpError: 501 POST /spaces` — confirmed
-this session, both locally and as the known finding from Week 1. **Until Spaces exists, you
-cannot see real cost/latency/quality bench numbers for ANYTHING**, including the quick-loop
-work that's already done. Build `/spaces` + the jobs worker first, not deep search, even though
-it's listed after in the README — it's the thing unblocking measurement.
+**What's next, in order:**
+1. **Hybrid retrieval** (README step 7): a `search_documents` tool over `chunks` —
+   `$vectorSearch` + `$search` fused with RRF, registered in `tools/registry.ts`, and wired
+   into the router so `mode: 'docs'` and `mode: 'auto'` actually call it. `repo/chunks.ts`
+   already exports `upsertChunks`/`probeChunkIndexed`; the retrieval query itself is not
+   written yet. **This is why `recall@5` is still `0/3` in this session's bench run** — the
+   documents are indexed correctly, nothing retrieves from them yet.
+2. `GET /stats` — deep-run cost + `deepDailyCap` remaining, off the `requests`/`runs`
+   collections already populated in Week 1.
+3. Deep search (README step 8): `plan_research` fan-out + merged citation numbering.
+
+**Done this session — Spaces + jobs worker (§5.4):**
+- New `repo/` files (the only files touching their collection, per the `repo/` rule):
+  `spaces.ts`, `documents.ts`, `chunks.ts` (upsert + the read-your-write probe query),
+  `jobs.ts` (atomic claim + a stale-job sweeper), `uploads.ts` (GridFS).
+- New `ingest/` package: `parse.ts` (pdfjs-dist page-aware PDF text extraction; markdown
+  split by heading; plain text split by line blocks), `chunk.ts` (sub-divides a section on
+  size, keeps its one locator), `index-document.ts` (the orchestrator: parse → chunk →
+  embed in batches of 64 → upsert → poll the probe up to 30s).
+- `http/spaces.routes.ts`: all 4 routes, multer memory-storage upload (field `file`),
+  404-not-403 scoping identical to `threads.routes.ts`, 413/400 on oversized/bad-mimetype
+  uploads.
+- `worker.ts` rewritten from the skeleton: polls `jobs`, claims atomically, runs
+  `index_document`, sweeps stale `running` rows every 10 ticks. Runs as its OWN PROCESS
+  (`npm run worker`) — this is what satisfies the bench's ingest-decoupling check (a PDF
+  parsing in a separate OS process cannot block the agent's SSE stream), not worker_threads.
+- Verified locally: 4 gold-corpus files (2 PDF, 2 md) all reach `indexed`; 202 accept latency
+  178-340ms (target ≤300ms p95, borderline warm-connection variance, not yet measured
+  properly under bench's own concurrency); a truly empty file correctly reaches `failed`
+  with a real error string; unknown-space and bad-mimetype uploads correctly 404/400.
+  `npm run -w @lumina/agent typecheck` and `npx eslint backend/agent/src --max-warnings 0`
+  both clean. `node quality/check.mjs .` still 0 errors (2 pre-existing warnings, unchanged).
+- **`node eval/eval.mjs` now reaches Gate 2 and runs it for real** (previously crashed with
+  `HttpError: 501 POST /spaces`). Gate 2 still fails, but on the two ALREADY-KNOWN Week 1
+  latency findings (ttft/answer p95) plus `recall@5 0/3` (hybrid retrieval not built — see
+  "what's next" above), not on anything Spaces-related. `citationGrounding`, `errorRate`,
+  `costPerAnswer`, `sourcesBeforeFirstToken`, and `citationsWithNoSource` all pass.
+
+**Not built / deliberately out of scope this session:** re-index-on-replace and
+delete-a-document (§5.4 lists both as "Could", not "Must").
 
 Read, in order: `README.md` → `packages/contract/src/http.ts` (spaces/documents schemas) →
 `TECHNICAL.md` (search for the RAG/Spaces and Deep Search sections — build guide, commands,
@@ -134,7 +168,8 @@ git**, or a fresh clone/session will have no record of how this was deployed.
 ### Still not done re: deploy
 - `SERPAPI_API_KEY` is empty — not set as a Fly secret either. Needed for the provider-swap
   test whenever that gets picked back up.
-- The 5 deploy config files above are uncommitted (see Git state).
+- The 5 deploy config files above are committed (`575fdc3`) — this line was stale as of the
+  Spaces/worker session; corrected here.
 - No redeploy has happened since the last local code change, if any — always redeploy both Fly
   apps after backend changes (`flyctl deploy -c fly.agent.toml --ha=false --no-public-ips` /
   `flyctl deploy -c fly.gateway.toml --ha=false`) and re-release IPs per finding 1 if the agent
@@ -152,20 +187,21 @@ the instructor's shared repo; nothing here should ever land on its `main`. All w
 - **`mine`** remote → `https://github.com/hoyinwan07/multi-agent-course.git` (your own fork)
 - Branch: **`2026-03-hoyinwan/lumina-week1`** — this is what Vercel's Production Branch is set to,
   and what the eval/deploy work in this handoff assumes is current.
-- Local `main` and `mine/2026-03-hoyinwan/lumina-week1` are in sync as of commit `9188f0c`.
-- Local `main` is **ahead of `origin/main` by 2 commits, behind by 14** — this is expected and
+- Local `main` and `mine/2026-03-hoyinwan/lumina-week1` are in sync as of commit `575fdc3`,
+  plus whatever this session commits on top (see "Done this session" above).
+- Local `main` is **ahead of `origin/main` by 3 commits, behind by 14** — this is expected and
   fine; we deliberately never touch `origin`.
 
 Commits so far:
 - `897736c` — Week 1 build (steps 1-11): loop, tools, gateway, memory. 58 files.
 - `9188f0c` — removed the invalid `_comment` from `web/vercel.json`.
+- `575fdc3` — Fly deploy config (agent private, gateway public) + Week 2 handoff. Includes
+  `.dockerignore`, both Dockerfiles, `fly.agent.toml`, `fly.gateway.toml` — these are
+  committed; an earlier version of this section calling them "uncommitted" was stale.
+- Spaces + jobs worker (this session) — see the commit this session made, listed at the top
+  of the file once committed.
 
 **Uncommitted right now** (`git status` at the `multi-agent-course` repo root):
-- `modules/.../Assignment_1_Lumina/DESIGN.md` — a small in-progress wording edit (one heading
-  changed), not yet committed. Don't lose it.
-- `modules/.../Assignment_1_Lumina/.dockerignore`, `backend/agent/Dockerfile`,
-  `backend/gateway/Dockerfile`, `fly.agent.toml`, `fly.gateway.toml` — all the deploy
-  infrastructure from this session, untracked. **Commit these.**
 - `modules/Module_1_Agent_Foundations_Harness_System_Design/package-lock.json` and
   `multi-agent-course/package-lock.json` — stray, empty, pre-date this work (from Sep 11,
   unrelated npm invocations at the wrong directory level). Leave untracked; not part of LUMINA.
@@ -221,9 +257,11 @@ dev/          try-tool.ts  check-grounding.ts  try-citations.ts  try-cache.ts  t
               try-memory.ts
 index.ts      threadsRouter + memoryRouter mounted BEFORE the 501 loop
 ```
-Week 2 adds under `backend/agent/src/`: something for Spaces/documents (routes + repo +
-ingestion pipeline), a jobs worker (`npm run worker -w @lumina/agent` already exists as a script
-— `src/worker.ts` doesn't exist yet), hybrid retrieval, and deep-search planning logic
+Week 2, added this session: `repo/spaces.ts`, `repo/documents.ts`, `repo/chunks.ts`,
+`repo/jobs.ts`, `repo/uploads.ts`, `ingest/parse.ts`, `ingest/chunk.ts`,
+`ingest/index-document.ts`, `http/spaces.routes.ts`, `worker.ts` (rewritten). Still to build:
+hybrid retrieval (a `search_documents` tool over `chunks`, registered in `tools/registry.ts`
+and wired into the router), `GET /stats`, and deep-search planning
 (`tools/plan_research.ts` already exists but is unregistered/unused).
 
 ## Files built (gateway — Week 1, all complete)
@@ -301,10 +339,13 @@ flyctl deploy -c fly.gateway.toml --ha=false
 - **A decision on the cost AND latency gates** — still open, see Known risks.
 - `SERPAPI_API_KEY` — not set locally or on Fly.
 - **Commit the 5 deploy config files** sitting uncommitted right now (see Git state).
-- **All of Week 2**: Spaces + jobs worker + hybrid retrieval + deep search + `/stats`. This is
-  the actual remaining scope of the assignment.
+- **Rest of Week 2**: hybrid retrieval (`search_documents`, RRF fusion, router wiring) +
+  deep search + `/stats`. Spaces + the jobs worker are done (this session) — see above.
 
-**Next session should:** commit the deploy files, then read `AGENTS.md` → `SPEC.md` →
-`packages/contract/src/http.ts` (Spaces/documents schemas) → `TECHNICAL.md`'s RAG/Spaces and
-Deep Search sections, and start with `POST /spaces` + the jobs worker — that's what unblocks
-`node eval/eval.mjs` past Gate 2 and makes every other number in this file measurable again.
+**Next session should:** commit the deploy files AND this session's new Spaces/worker files
+(all currently untracked/modified, listed below), then build hybrid retrieval —
+`search_documents` over `chunks` with `$vectorSearch` + `$search` fused by RRF, registered
+in `tools/registry.ts`, wired into the router for `mode: 'docs'`/`'auto'`. That is what turns
+this session's `recall@5 0/3` into a real number and is the last thing standing between
+Gate 2 and an actual pass (the ttft/answer p95 misses are the pre-existing Week 1 finding
+above, a separate decision still open).

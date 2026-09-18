@@ -43,6 +43,7 @@ import { HealthResponse, ROUTES } from '@lumina/contract';
 import { env } from './env.js';
 import { pingDb } from './db.js';
 import { memoryRouter } from './http/memory.routes.js';
+import { spacesRouter } from './http/spaces.routes.js';
 import { threadsRouter } from './http/threads.routes.js';
 
 const log = pino({ level: env.logLevel });
@@ -79,6 +80,7 @@ app.get('/health', async (_req, res) => {
 // would report "not implemented" for something that is.
 app.use(threadsRouter);
 app.use(memoryRouter);
+app.use(spacesRouter);
 
 // ---------------------------------------------------------------- everything else: 501
 
@@ -113,6 +115,6 @@ app.listen(env.port, () => {
     },
     // Names what is live, because a startup line that is out of date is a startup line
     // that sends the next reader looking for a bug in the wrong service.
-    'agent up — /health, /threads and /memory are live; every other route is still 501'
+    'agent up — /health, /threads, /memory and /spaces are live; every other route is still 501'
   );
 });

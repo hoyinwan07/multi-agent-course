@@ -207,7 +207,7 @@ Every run produces ONE record, and this ONE record is saved to both:
 This stored record in the `runs` collection will later be used for aggregation in `/stats`.
 ```
 
-**The consistency story for written-but-not-yet-readable.** Atlas Search indexes are eventually
+**CONSISTENCY, written but not yet readable.** Atlas Search indexes are eventually
 consistent: a document that has been upserted is not necessarily searchable. In Week 1 this touches
 only `memories`: a memory saved during one request may not be recallable microseconds later -but
 it is harmless, because recall happens at the start of a subsequent request, by which time the

@@ -226,7 +226,7 @@ Every run produces ONE record, and this ONE record is saved to both:
 - the `runs` collection in MongoDB
 
 This stored record in the `runs` collection is cross-checked by the benchmark; `/stats` itself is
-aggregated from `messages`, not from `runs` — see above for why.
+aggregated from `messages`, not from `runs` -see above for why.
 ```
 
 **CONSISTENCY is written but not always immediately readable.** Atlas Search indexes are eventually
@@ -258,7 +258,7 @@ It would be reasonable to work around it, keep that capability, and enforce grou
 post-hoc validation (testing / evaluating after). Given that the ordering is contractual, I do 
 not think this alternative is available or a reasonable approach.
 
-**2. Snippet selection is through deterministic code, not the model's choice.** For each retrieved
+**2. Snippet selection is determined by the code, not the model.** For each retrieved
 page I score overlapping passages AGAINST the query and take the best-scoring one, verbatim. 
 A model asked to quote a page paraphrases it, and a paraphrase fails a verbatim grounding check.
 **THE TRADEOFF: precision.** My chip is "the most query-relevant passage from a page this answer used"
@@ -281,7 +281,7 @@ The rule and the red line are checking different things:
 - The red line cares only about dishonest endings
 The runs satisfy the red line's actual intent: every `cap`-terminated run is stated, and doesn't
 claim any completion it didn't reach. I chose to keep `terminated:"cap"` honest rather than tune
-the budget or the exit heuristic to make A2 pass, because bounded-and-honest (addressed in the PRD)
+the budget or the exit heuristic to make A2 pass, because bounded and honest (addressed in the PRD)
 matters more here than a clean quality report. I think it's important to focus on the original vision
 and value that the MVP product should bring to the user versus a better report (for now).
 However, this would become a critical issue if it were hiding a real budget constraint behind a looser
@@ -309,11 +309,11 @@ So for now, **the TRADEOFF** is that rate limit currently does not scale effecti
 
 **5. Deep search fans out over sub-questions rather than letting the model call `plan_research`
 whenever it wants.** `plan_research.ts` is registered nowhere in `tools/registry.ts` and is
-deliberately never called through it — its file header explains why in detail. The Must that
-matters most for deep search is that the `plan` event ships before ANY retrieval starts; that
-ordering has to be structural, not a matter of system-prompt wording a model might ignore. So
+deliberately never called through it (the file header explains why). The requirement that
+matters most for deep search is that the `plan` event triggers before ANY retrieval starts. That
+ordering has to be structural (system-prompt wording a model might ignore). So
 `loop/deep.ts` calls the LLM once, directly, with `tools:[planResearch]` and `toolChoice` forced,
-before the retrieval loop exists at all — then fans out one ordinary `retrieve()` call per
+before the retrieval loop exists at all. Then fans out one ordinary `retrieve()` call per
 sub-question with bounded concurrency (`SUBQUESTION_CONCURRENCY = 3`), each tagged with a fixed
 `subQuestion` index passed as a parameter, never inferred from which fetch happened to occur near
 which part of a shared conversation several turns later.

@@ -31,9 +31,8 @@ written up as an artifact: **https://claude.ai/artifact/H2rjHxKGDpeZeBjjnW2xsh**
   are itemised under "What is actually worth points".
 - 15 manual points open for a grader, **1 red line still crossed (A2)** — see #2 below for
   how much the underlying cap rate moved even though the red line itself is still crossed.
-- Git: local `main` is at `f8355a6`; **`mine/2026-03-hoyinwan/lumina-week1` has NOT been
-  pushed since `bf0bab7`** — `634c113` and `f8355a6` are local-only. Push before you rely
-  on the fork being current. Nothing uncommitted except 2 harmless untracked stray
+- Git: local `main` and `mine/2026-03-hoyinwan/lumina-week1` are identical at `b0e3f5c`.
+  Everything is pushed. Nothing uncommitted except 2 harmless untracked stray
   `package-lock.json` files (see Git state below).
 - Deploy: agent is at **Fly release v9** (#3a + #3b baked in), and the machine is now
   **2 shared vCPUs, not 1** (`fly.agent.toml`). Gateway still carries the bench run from

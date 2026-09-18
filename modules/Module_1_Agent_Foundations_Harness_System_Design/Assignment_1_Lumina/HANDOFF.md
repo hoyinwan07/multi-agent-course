@@ -65,13 +65,25 @@ Real numbers from the last full bench run against the deployed gateway
      exits `done` even when the model asked for more calls than remained. Same shape of
      fix as today's — verify a few real over-budget requestIds like `req_87d8e52f-5e2`
      against the new code before trusting it.
-2. **A2 red line crossed** — 47 runs terminated `"cap"` (mostly deep-search sub-questions
-   dividing the fixed 24-call budget across 3-7 questions), a few `"error"`. `DESIGN.md`
-   Trade-offs #3 argues this is honest, not dishonest, and chooses not to game the rule —
-   that reasoning still holds. But before assuming it's permanent: is there a real
-   improvement (e.g., raising `expectations.json`'s call ceiling, or dividing the
-   sub-question budget less aggressively) that reduces how often runs cap out, without
-   contradicting the "never fake `done`" principle? Worth a genuine look before re-accepting.
+2. **DONE — A2 red line, config fix.** Root cause: `deep.ts` divides the 24-call budget
+   evenly across sub-questions (up to 6, after 1 reserved for recall) — 3 calls each, i.e.
+   1 search + only 2 fetches. `MIN_EVIDENCE_TO_EXIT_SUBQUESTION=2` needs BOTH to succeed,
+   zero retry room. One 403/paywall on either fetch caps that sub-question, and
+   `deep.ts`'s `outcomes.some(cap)` marks the WHOLE run `cap`. With 6 sub-qs × 2 fetches =
+   12 rolls, a failure was near-guaranteed. **NOT touched**: `expectations.json` (declared
+   pre-submission, changing it now would be exactly the gaming `DESIGN.md`'s Trade-offs #3
+   already rejected).
+   - **Fix**: `DEEP_SUB_QUESTIONS_MAX` 6 → 4 (`.env`, gitignored — not a git diff; also set
+     as a Fly secret on the agent, staged + deployed same session). Each sub-question now
+     gets 5 calls (4 real fetch attempts vs 2). Safe against every declared gate:
+     `sla.json` only requires ≥3 sub-questions (no max), contract allows 2-8, deep's
+     source-ratio margin (2.3-2.7x vs 2.0x required) has room to spare.
+   - **Verified locally**: 2 real deep queries, both `terminated: 'done'`, both well under
+     the $0.35 cap ($0.16-$0.22). Bonus: 2 of the 4 sub-questions in the first test only
+     survived because of fast-follow #1b's reorder fix (`dropped:1` alongside a clean
+     evidence-threshold exit) — the three fixes compound on the deep path.
+   - **Not yet confirmed at scale** — needs a full bench run (holding per instruction,
+     batching with whatever's next) to see A2's real-world cap rate move.
 3. **ttft p95 13.2s / answer p95 16.4s** (targets 2.5s/12s) — the oldest, biggest open
    problem, unaddressed since Week 1. Local floor was measured at ≈3.6s; the deployed
    number is 3-4x that. Not yet root-caused whether this is dominated by the Fly↔Atlas

@@ -310,14 +310,19 @@ export async function retrieve(args: RetrieveArgs): Promise<RetrieveOutcome> {
       });
     }
 
-    if (dropped > 0) {
-      log.info({ dropped, cap: gear.maxToolCalls }, 'phase 1 truncated a turn at the cap');
-      return { terminated: 'cap', evidence: store.all(), turns, memories };
-    }
-
     // Enough material to answer from: stop here rather than spend a turn being told DONE.
     // `done` is honest — the loop finished on its own terms, it just used a rule instead of
     // a round trip to decide.
+    //
+    // Checked BEFORE `dropped > 0` on purpose, and that ordering is itself a fix: this used
+    // to run after the dropped-cap return, so a turn whose request got truncated at the cap
+    // was ALWAYS `cap`, even when the calls that DID run already pushed `store.size` past
+    // the threshold. A model that asks for one more page than the budget allows is not
+    // evidence the page it already has is thin — it is just an ambitious ask. Checking
+    // evidence first means "the model wanted more, but we already have enough" now reads as
+    // `done` (honest — Phase 2 only ever reads `store`, so nothing is lost), and `cap` is
+    // reserved for when the truncation actually cost us: not enough evidence AND no budget
+    // left to get more.
     //
     // Originally gated on "and nothing failed in this turn" too, on the theory that a
     // failure meant the model might want to compensate by fetching an alternative URL. In
@@ -332,8 +337,13 @@ export async function retrieve(args: RetrieveArgs): Promise<RetrieveOutcome> {
     // never the raw tool-call outcomes, so a run that exits here loses nothing a
     // continuing turn would have given the answer.
     if (store.size >= minEvidenceToExit) {
-      log.info({ turns, evidence: store.size }, 'phase 1 exited on the evidence threshold');
+      log.info({ turns, evidence: store.size, dropped }, 'phase 1 exited on the evidence threshold');
       return { terminated: 'done', evidence: store.all(), turns, memories };
+    }
+
+    if (dropped > 0) {
+      log.info({ dropped, cap: gear.maxToolCalls }, 'phase 1 truncated a turn at the cap');
+      return { terminated: 'cap', evidence: store.all(), turns, memories };
     }
 
     messages.push({ role: 'assistant', text: reply.text, toolCalls: reply.toolCalls });

@@ -4,22 +4,31 @@
 
 **Submitted 2026-09-18.** Live at **https://hw-lumina-beta.vercel.app** — `/` works for a
 stranger, `/evals` renders a real report built from a real deployed run. Everything is
-committed and pushed; nothing is hanging mid-flight. This session's goal from here is
-**fast-follow work to improve the failing eval metrics** before the resubmission window
-closes, starting a fresh chat per-topic rather than one long thread.
+committed and pushed; nothing is hanging mid-flight. **Next up: fast-follow #3 (ttft/answer
+latency)** — start a fresh chat for it per the per-topic-thread convention.
 
-**State of the submission right now (after fast-follow #1, same day):**
-- Score: **73/85 automated**, down 2 from the 75/85 baseline — same scale, a real (small)
-  drop, not a denominator artifact. Traced to Deep search scoring 13/15 instead of 15/15
-  this run (one of the 4 deep queries hit the 240s/24-call ceiling) — unrelated to fast-
-  follow #1, which is scoped to quick/web queries. See #1 below for what #1 itself did and
-  didn't move. 15 manual points open for a grader, **1 red line crossed (A2)** — explained
-  and accepted as an honest trade-off in `DESIGN.md`'s Trade-offs #3, not a bug being hidden.
-- Git: local `main` and `mine/2026-03-hoyinwan/lumina-week1` are identical at `d600cb7`
-  (fast-follow #1's commit). Nothing uncommitted except 3 harmless untracked files (see Git
+Full audit of what's shipped so far, with before/after numbers and root causes, is written
+up as an artifact: **https://claude.ai/artifact/H2rjHxKGDpeZeBjjnW2xsh** — read that before
+this file's priority-list detail if you want the fast version.
+
+**State of the submission right now (after fast-follows #1, #1b, #2, same day):**
+- Score: **66/85 automated**, down from 75/85 baseline. This is NOT #1/#1b/#2 regressing —
+  each measurably improved its own target metric (see #1/#2 below). The drop is a NEW,
+  separate, NOT-yet-root-caused regression: **search cache hit rate 92.5% → 45%** (target
+  ≥50%), which showed up in the same bench run. Confirmed by diff that neither fix touched
+  the caching layer (`search.tavily.ts`, `repo/searchCache.ts`) — leading hypothesis is
+  Mongo TTL expiry between bench runs (`repo/searchCache.ts` documents the TTL), not
+  confirmed. **This deserves its own look before #3, or right after — it's actively costing
+  more score than #1/#2 combined ever did.**
+- 15 manual points open for a grader, **1 red line still crossed (A2)** — see #2 below for
+  how much the underlying cap rate moved even though the red line itself is still crossed.
+- Git: local `main` and `mine/2026-03-hoyinwan/lumina-week1` are identical at `bf0bab7`.
+  Nothing uncommitted except 2 harmless untracked stray `package-lock.json` files (see Git
   state below).
-- Deploy: both Fly apps (agent redeployed at v5, gateway redeployed with the fresh report)
-  and Vercel are live and serving the current code + the current `reports/report.json`.
+- Deploy: agent is at Fly release v7 (all three fixes baked in). Gateway was just
+  redeployed with the SECOND bench run's `reports/report.json` — if `/evals`'s
+  `runNotes` doesn't mention "fast-follows #1, #1b, #2", the gateway image is stale; see
+  "Where the real report lives" below for the regen procedure. Vercel unchanged, still live.
 
 **One diagnostic finding worth knowing before you dig into anything else:** the header's
 health-check dot can show "gateway unreachable" on a page's first load if the gateway
@@ -44,27 +53,22 @@ Real numbers from the last full bench run against the deployed gateway
      turn instead of 2 (verified both locally and against a real request in this run,
      `req_87d8e52f-5e2` aside — see below). The web-query error sub-metric this was aimed
      at went from **3/40 failing → 40/40 answered, 0 errors** in the post-fix bench run.
-   - **quickBudget did NOT improve this run** (10/75 over budget vs the prior 6/72) — do
-     not read that as the fix failing. Traced every over-budget run in this bench's own
-     Mongo docs (`createdAt >= today`) and none of them are cases the fix targets: they're
-     either (a) a turn whose model request exceeded the remaining call budget, which hits
-     the `dropped > 0 → return 'cap'` branch — that check runs BEFORE the evidence-threshold
-     check and short-circuits it even when evidence is already sufficient (e.g.
-     `req_87d8e52f-5e2`: ended at exactly 8 calls, `cap`, despite reaching 4 evidence items
-     by the end — the *next* thing worth trying, and it overlaps with #6's tool-thrash
-     finding), or (b) runs needing genuinely many real tool calls with zero failures at all
-     (e.g. `req_528531d6-7c4`: 0 fails, still hit 8 calls). Both are workload variance /
-     separate mechanisms, not something this fix could reach.
-   - **The overall automated score didn't move** (73/85 vs 75/100 baseline) because the
-     Performance & SLA bucket is dominated entirely by ttft (30s vs 2.5s target this run) —
-     #3 below. Fixing #1 cannot show up in the score until #3 moves. Error rate's SLA gate
-     also still fails (0.0125 > 0.01), but now **entirely from one deep-search timeout**,
-     not from any web/quick error — the fix's target metric is clean.
-   - **Next step for this thread**: try checking the evidence threshold BEFORE the
-     `dropped > 0` cap check in `retrieve.ts`, so a turn that already has enough evidence
-     exits `done` even when the model asked for more calls than remained. Same shape of
-     fix as today's — verify a few real over-budget requestIds like `req_87d8e52f-5e2`
-     against the new code before trusting it.
+   - **`quickBudget` fix #1b applied same day** (reorder the `dropped > 0` check to run
+     AFTER the evidence-threshold check — a turn whose request got truncated at the call
+     cap no longer auto-`cap`s if the calls that DID run already had enough evidence).
+     Verified against `req_87d8e52f-5e2` by hand: would now read `done`.
+   - **`quickBudget` STILL not improved at bench scale after #1b either** (6/72 baseline →
+     10/75 → 11-12/75-86 across both post-fix runs). This is the one part of #1 genuinely
+     unresolved. Every over-budget run checked traces to either a turn with a real,
+     unrecoverable failure streak (multiple domains 403ing in the same turn — a content-
+     availability problem, not a loop-logic one) or a query that legitimately needs many
+     real tool calls. Likely overlaps #6 (tool thrash: `fetch_page` called 5-11x
+     consecutively). **Worth a fresh look, but it is NOT the same bug #1/#1b already fixed
+     — don't re-chase the `allOk`/`dropped` angle here, it's been wrung out.**
+   - **Score impact**: web-query error rate is fully clean now (0/40, confirmed on BOTH
+     post-fix bench runs). The Performance & SLA bucket score doesn't reflect this because
+     it's still dominated by ttft (#3) failing outright — fixing #1 can't show in the score
+     until #3 moves.
 2. **DONE — A2 red line, config fix.** Root cause: `deep.ts` divides the 24-call budget
    evenly across sub-questions (up to 6, after 1 reserved for recall) — 3 calls each, i.e.
    1 search + only 2 fetches. `MIN_EVIDENCE_TO_EXIT_SUBQUESTION=2` needs BOTH to succeed,
@@ -78,24 +82,36 @@ Real numbers from the last full bench run against the deployed gateway
      gets 5 calls (4 real fetch attempts vs 2). Safe against every declared gate:
      `sla.json` only requires ≥3 sub-questions (no max), contract allows 2-8, deep's
      source-ratio margin (2.3-2.7x vs 2.0x required) has room to spare.
-   - **Verified locally**: 2 real deep queries, both `terminated: 'done'`, both well under
-     the $0.35 cap ($0.16-$0.22). Bonus: 2 of the 4 sub-questions in the first test only
-     survived because of fast-follow #1b's reorder fix (`dropped:1` alongside a clean
-     evidence-threshold exit) — the three fixes compound on the deep path.
-   - **Not yet confirmed at scale** — needs a full bench run (holding per instruction,
-     batching with whatever's next) to see A2's real-world cap rate move.
-3. **ttft p95 13.2s / answer p95 16.4s** (targets 2.5s/12s) — the oldest, biggest open
-   problem, unaddressed since Week 1. Local floor was measured at ≈3.6s; the deployed
-   number is 3-4x that. Not yet root-caused whether this is dominated by the Fly↔Atlas
+   - **Confirmed at bench scale**: deep cap rate **4/4 (100%) → 1/4 (25%)** on the same
+     fixed-size sample (bench always runs exactly 4 deep queries) — measured across the two
+     post-fix bench runs, isolated by Fly-release deploy timestamp so it's a clean before/
+     after, not accumulated history. A2 the RED LINE is still technically crossed (one cap
+     this run, plus the accumulated run history `quality/check.mjs` reads from `runs/`), but
+     the actual rate that has to hit zero for it to clear moved 4x from one config edit.
+   - **If picking this back up**: the one remaining cap this run was a genuine case (not a
+     loop-logic bug) — worth checking whether it's the same "multiple domains 403 in one
+     turn" pattern as #1's remaining quickBudget failures before assuming a further
+     `DEEP_SUB_QUESTIONS_MAX` cut (e.g. to 3) is the next lever, since that trades away
+     source-ratio margin (currently 2.75x vs 2.0x required) for less obvious gain.
+3. **START HERE NEXT — ttft p95 24.4s / answer p95 27.7s** (targets 2.5s/12s), measured on
+   the latest bench run (worse than the 13.2s/16.4s cited at the top of this list
+   originally — that number is stale, this is current). The oldest, biggest open problem,
+   unaddressed since Week 1. Local floor was measured at ≈3.6s; the deployed number is
+   7-8x that now. Not yet root-caused whether this is dominated by the Fly↔Atlas
    cross-region hop, cold connections, or something in the loop itself — worth actually
-   profiling before assuming it's unfixable.
-4. **deep plan p95 6.4s** (target 4s) — already tuned once this cohort (`PLAN_MAX_TOKENS`
-   + a "reasons ≤10 words" prompt change brought it from 9.95s down to ~6.4s). Diminishing
-   returns from prompt tuning alone per the existing write-up in `DESIGN.md` — a
-   structurally different approach (e.g., a second unforced call for reasons, done in
-   parallel) might be worth trying if #3 doesn't eat the whole session.
-5. **search p95 during ingest 1.312x vs 1.3x target** — marginal, basically noise-level.
-   Lowest priority; may just flip on a re-run.
+   profiling (e.g. time-to-first-byte on the Atlas connection vs the LLM's first-token
+   latency vs the eager recall/search round trip) before assuming it's unfixable. Findings
+   #5 and #6 below (TTFT floor, LLM turns ≈74% of latency) are the starting context.
+4. **deep plan p95 ~6.1s** (target 4s) — essentially unchanged by fast-follow #2 (6056ms
+   this run vs 6.4s before; fewer sub-questions to plan for didn't move plan latency
+   noticeably — makes sense, `PLAN_MAX_TOKENS` caps the SAME ceiling regardless of how many
+   sub-questions come out of it). Diminishing returns from prompt tuning alone per the
+   existing write-up in `DESIGN.md` — a structurally different approach (e.g., a second
+   unforced call for reasons, done in parallel) might be worth trying if #3 doesn't eat the
+   whole session.
+5. **RESOLVED, likely just noise** — search p95 during ingest is now **0.92x** (was
+   1.312x, target ≤1.3x) — passing comfortably on this run. Was already marked "may just
+   flip on a re-run"; it did. No action taken, nothing to revisit unless it regresses again.
 6. **A3 warn: tool thrash** — `fetch_page` called 5-11x consecutively against a cap of 4,
    in multiple runs. Worth checking whether these are productive retries (different URLs,
    legitimately needed) or wasted ones before deciding whether to tighten the cap or leave it.
@@ -272,7 +288,9 @@ Commits, oldest first:
 2. `normalize()` has NO NFKC — matches `benchmark/lib.mjs`.
 3. Longer snippets are safer; 30-token windows.
 4. `res.on('close')`, never `req.on('close')`, in both the agent and the gateway.
-5. TTFT 2500ms is unreachable; floor ≈ 3.6s local (13.2s observed on the current deploy).
+5. TTFT 2500ms is unreachable; floor ≈ 3.6s local (24.4s observed on the current deploy,
+   2026-09-18 post-fast-follow-#2 bench run — this number has moved between runs, always
+   re-check rather than trusting this line).
 6. LLM turns are ~74% of latency, tools ~26%.
 7. `RATE_LIMIT_PER_MINUTE` raised from 30 → 300.
 8. `sla.json` cost rates are placeholders (Sonnet 5 is really $2/$10, not $3/$15).

@@ -3,8 +3,90 @@
 ## READ THIS FIRST — exact resume point
 
 **Submitted 2026-09-18.** Live at **https://hw-lumina-beta.vercel.app** — `/` works for a
-stranger, `/evals` renders a real report built from a real deployed run. Everything is
-committed and pushed; nothing is hanging mid-flight.
+stranger, `/evals` renders a real report built from a real deployed run.
+
+### ⏭️ THE NEXT SESSION'S JOB, in one line
+
+**Deploy the agent, run one full bench, rebuild the report, redeploy the gateway** — then
+read the four rows in "Fast-follow #5" below. Fast-follow #5 is **committed and typechecked
+but NOT deployed and NOT bench-measured**; `/evals` is still showing the 68/100 run from
+before it. Nothing else is worth starting until that number exists.
+
+```bash
+# from the assignment root — the full chain, ~15 min, ~$2-3
+export FLYCTL_INSTALL="/Users/hoyinwan/.fly"; export PATH="$FLYCTL_INSTALL/bin:$PATH"
+flyctl deploy -c fly.agent.toml --ha=false --no-public-ips
+flyctl ips list -a lumina-agent-hoyinwan            # MUST print nothing
+cd backend/agent && npx tsx src/dev/try-cache.ts --purge && cd ../..
+cp reports/bench.json reports/bench.prev.json       # see "no baseline in git" below
+node benchmark/bench.mjs --target https://lumina-gateway-hoyinwan.fly.dev
+node scripts/export-runs.mjs && node quality/check.mjs .
+# then eval/build-report.mjs — full invocation under "Where the real report lives"
+flyctl deploy -c fly.gateway.toml --ha=false
+```
+
+**Before you run it, check one thing that will otherwise waste the whole bench:** confirm
+Phase 1 is actually on Haiku in the deployed agent. `LLM_MODEL_PHASE1` defaults to
+`claude-haiku-4-5` in `env.ts` (committed, no secret needed), but if a Fly secret of that
+name was ever set to something else it wins. After the first request, the agent log line
+`phase 1 turn` carries `model` — it must read `claude-haiku-4-5`.
+
+### Fast-follow #5 — built this session, NOT yet measured
+
+Commit `8ca5ae4`. Two changes, both aimed at ttft, both off the critical path:
+
+1. **Speculative fetch.** `web_search` now returns structured `hits`; Phase 1 starts
+   fetching the top 3 the instant the search returns, concurrently with the first LLM turn.
+   Verified locally: turn 1 = 2260ms, longest fetch = 2349ms, finishing together. Old path
+   `2260 + 2349 = 4609ms`; new path `max(2260, 2349) = 2349ms`.
+2. **Phase 1 on Haiku 4.5.** `LLM_MODEL_PHASE1` (default `claude-haiku-4-5`). Phase 2 — the
+   model that writes the answer, and what `done.model` and `/health` name — stays Sonnet 5.
+
+**The four rows to watch, and what would count as #5 working:**
+
+| row | last measured | #5 lands if |
+|---|---|---|
+| ttft p95 | 11060ms | **≤2500ms** — the whole point, and the least likely |
+| answer p95 | 15389ms | ≤12000ms — should move with ttft |
+| deep plan p95 | 4554ms | ≤4000ms — **untouched by #5**, see below |
+| search cache | 47.5% | ≥50% — **untouched by #5**, needs Lever 1 |
+
+> **Do not expect `bench.pass` to flip.** It needs ALL FOUR of those passing at once
+> (`benchmark/bench.mjs:1007`). #5 targets the first two only. Even a large ttft
+> improvement leaves deep plan p95 and the cache row failing, and the 10-point
+> Performance & SLA row scores zero until every one of them passes.
+
+**The honest caveat on Haiku, recorded because it is easy to over-read the commit message:**
+measured on a laptop, Haiku's Phase-1 turn (1861-2644ms) is **barely faster than Sonnet's**
+(2260ms). Most of that number is network round-trip to the API, not model compute. The
+separation should appear deployed in `iad`, but that is an assumption, not a measurement —
+the deployed bench is what decides it. If Haiku turns out to be no faster deployed, set
+`LLM_MODEL_PHASE1=claude-sonnet-5` and keep the speculative fetch, which is independently
+verified.
+
+**Two gotchas in this change, both already handled — do not "fix" them back:**
+- **Haiku 4.5 rejects `output_config.effort` outright and takes no adaptive thinking.**
+  Sending the Sonnet request shape at it is a 400, not a degraded answer. That is what
+  `tuning()` in `providers/llm.anthropic.ts` exists for; it is spread into BOTH `complete`
+  and `stream` so the two paths cannot drift.
+- **An abandoned speculation emits no trace step and takes no cap slot.** Deliberate:
+  `bench.mjs:673` fails a quick run whose trace exceeds 8 steps, so tracing a fetch the
+  model never asked for would spend the envelope that evidence is measured against, and
+  would misreport the trajectory. Abandonments are logged server-side
+  (`phase 1 speculative fetch outcome`, with `claimed`/`abandoned`). Claim rate measured
+  3/3 single-request, 7/12 at concurrency 4.
+- **`save_memory` still works** — verified, trace step present. `bench.mjs:736` sends
+  "Remember this preference…" as an ordinary quick web query and requires a `save_memory`
+  step, which is exactly why Phase 1 runs *in parallel with* the speculative fetches and is
+  never skipped. **Any future attempt to cut Phase 1 out of the critical path entirely must
+  re-check this**, or the memory row goes 10/10 → 0.
+
+**Deep search was deliberately left on Sonnet.** Routing the deep PLAN to Haiku would also
+attack `deep_plan_p95_ms` (4554ms vs 4000 target — the third lock on `bench.pass`), but the
+plan is graded by a human on whether "those sub-questions are ones a person would actually
+have asked" (`eval/rubric.json:83`), and `min_deep_sub_questions` / `min_deep_source_ratio`
+both key off it. That is a real trade against 5 manual points; it needs a decision, not a
+default.
 
 ### ⚠️ RETRACTED — the "latency is worth ZERO points" box that used to lead this file
 
@@ -77,6 +159,42 @@ current code no longer produces the behaviour the rule is catching.
 > "do not edit the grader" rule reject. It was NOT done. Decide it explicitly, in writing,
 > before anyone touches `runs/`.
 
+#### A2 conflicts with a requirement the rubric makes elsewhere — raise this, don't absorb it
+
+A compliant submission is **required to contain a run that did not end `done`**, and A2 then
+fails because of it. The chain, all verifiable in about a minute:
+
+| side | where | what it says |
+|---|---|---|
+| A2 fails on any non-`done` run | `quality/rules.json:34` | "Every run ends with `terminated='done'`." |
+| | `quality/check.mjs:69` | `run.terminated === 'done' ? null : fail` |
+| | `quality/check.mjs:27-34` | `overRuns` — fails if ANY run is bad |
+| | `quality/check.mjs:184-188` | loads every `.json` in `runs/`, unfiltered |
+| | `eval/build-report.mjs:278` | wires the red line to A2's status |
+| but a failing run is required | `eval/rubric.json:93` | "/evals renders one successful and one **failing** trajectory in full" |
+| | `.claude/skills/fde-lumina-eval/SKILL.md:88` | "If there is no failing run, tell them to make one: unset the search provider key and ask a question." |
+
+**Proof they land on the same run:** `req_885735f9-2ad` is the failing trajectory `/evals`
+renders for the human gate, and it is also one of the 62 entries in A2's failure detail.
+
+There IS an opt-out — `quality/check.mjs:68`,
+`if (ctx.exp.trajectory?.mustTerminate === false) return null` — but `expectations.json:19`
+ships as `true` in the provided scaffold, and a student only learns they needed `false`
+after producing the failing run the rubric asked for, at which point the eval instructions
+forbid lowering a threshold in that file. **It has not been touched, and should not be.**
+
+The useful observation to hand the instructor: the red line's own wording is "no run that hit
+a cap **reported as** `terminated=done`", which describes a capped run *mislabeled* as
+successful — a rule this project would never trip, since its caps are honestly labelled
+`cap`. The implementation is broader than the standard it states. Scoping A2 to the bench's
+own runs, or checking for that mislabeling, would let both requirements hold.
+
+**Three things to put to the instructor in one message**, drafted 2026-09-19: (1) this A2
+conflict, led by the finding and not by the score; (2) the two stretch-bonus questions under
+Lever 3 — additive or capped, and how a rule is "submitted to the cohort `rules.json`" when
+`quality/` is do-not-edit; (3) a proactive disclosure of the `web/vercel.json` edit
+(`9188f0c`) with the offer to revert it. Disclosing that one beats having it found.
+
 ### The 75 was never real — settle this before ever "reverting to the first version"
 
 The score history reads 75 → 73 → 66 → 68, which looks like every fix made things worse. It
@@ -118,13 +236,24 @@ already in `runs/`, and 13 of the 111 quick-shaped runs (11.7%) issued a second 
 budget.** Same runs, both rows: cache hit rate and `quickBudget` are **one bug, not two**.
 Identify which of the 20 repeat queries refined, read its trace, fix that trigger.
 
-**Lever 2 (harder, unlocks the 10-pt row): get the Phase-1 turn off the critical path.** See
-the retraction box at the top. This is what makes `bench.pass` reachable at all, and it may
-also cut refinements further (a run that never needs a second round never issues a second
-search), so it partly subsumes Lever 1.
+**Lever 2 — BUILT as fast-follow #5 (`8ca5ae4`), awaiting its bench.** See the section at
+the top of this file. Note it does NOT subsume Lever 1: speculation changes *when* pages are
+fetched, not *whether* the model refines its search, so the cache row is untouched.
 
-Do Lever 1 first — it is a trace read, not an architecture change — then re-bench before
-starting Lever 2, so the two effects stay separable.
+**Lever 3 (newly identified, ~15 pts, zero code risk): the stretch bonus.**
+`eval/rubric.json:103` carries a `stretch_bonus` block worth 3 × 5 pts that appears **nowhere
+in `eval/build-report.mjs` or `eval/eval.mjs`** — it is not auto-scored, never reaches
+`/evals`, and had never been mentioned in this file. `new_rule_with_precedent` is a *writing*
+task needing a real incident with a date and what it cost, and this project has several fully
+documented: the jsdom parse freezing the event loop, `.dockerignore` hiding `reports/`,
+`db()` caching a broken `MongoClient` after a failed connect.
+**Two questions to settle with the instructor before building any of it:** `total_points` is
+100 and automated + manual already sum to 100, so whether stretch is additive or capped is
+genuinely ambiguous; and the rule is "submitted to the cohort `rules.json`" while `quality/`
+is on the do-not-edit list, so that is a submission process, not a file edit.
+
+Order: **bench #5 first** (it is already built and the number is missing), then Lever 3
+(cheap, no code), then Lever 1 (a trace read).
 
 **State of the submission right now (after fast-follows #1, #1b, #2, #3a, #3b, #4, #4b):**
 - Score: **68/100**, measured 2026-09-19 and live on `/evals`. State it this way, not as
@@ -133,10 +262,16 @@ starting Lever 2, so the two effects stay separable.
   The 17 missing automated points are itemised under "What is actually worth points".
 - 15 manual points open for a grader, **1 red line still crossed (A2) — but from history
   only**, see the box above. Zero runs of current code cap.
-- Git: `main` == `mine/2026-03-hoyinwan/lumina-week1` == `f181eaa`; the only uncommitted
-  change is this file. `reports/` and `runs/` are gitignored, so the rebuilt report and the
-  ~150 new run logs exist **only on this machine and inside the deployed image** — they are
-  not recoverable from git if lost. See Git state below.
+- Git: `main` == `8ca5ae4` (fast-follow #5). **`reports/` and `runs/` are gitignored**
+  (`.gitignore:7-8`), so there is NO bench baseline in git — the 2026-09-19 run overwrote
+  `reports/bench.json` and the pre-#4 SLA numbers are gone, which is why nobody can say
+  whether ttft regressed across that run. **Copy `reports/bench.json` aside before every
+  future bench** (the resume block at the top does this).
+- **Red line exposure worth knowing before a grader finds it:** `rubric.json`'s red line
+  says the provided directories are "unmodified", and commit `9188f0c` deletes the inert
+  `_comment` field from `web/vercel.json`. It was necessary — Vercel's schema validation
+  rejected the deploy — the functional rewrite rule is untouched, and it is the only change
+  to any provided directory. Low risk, but disclose it rather than let it be discovered.
 - Deploy: agent at **Fly release v11** (#3a, #3b, #4, #4b baked in), **2 shared vCPUs**
   (`fly.agent.toml`). **Gateway redeployed 2026-09-19** with this run's `reports/report.json`
   baked in — verified live: `GET /evals/report.json` returns `awarded: 68`,

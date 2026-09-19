@@ -118,7 +118,10 @@ export const webSearch: Tool = {
     return {
       ok: true,
       observation: renderHits(usable),
-      reason: `searched ${via} for "${query}" — ${usable.length} results`
+      reason: `searched ${via} for "${query}" — ${usable.length} results`,
+      // Same hits, same order, structured. `usable` is already past the blocked-host
+      // filter, so a speculative fetch never starts on a host measured to refuse us.
+      hits: usable.map((h) => ({ url: h.url, title: h.title }))
     };
   }
 };

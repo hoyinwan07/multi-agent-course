@@ -47,6 +47,15 @@ export type ToolOk = {
   evidence?: EvidenceItem[];
   /** Why this step happened, for the trace. The trace is a debugging surface, not a bar. */
   reason?: string;
+  /**
+   * The hits behind `observation`, in the same order, for `web_search` only.
+   *
+   * The model reads `observation`; the LOOP reads this. It exists so Phase 1 can start
+   * fetching the top hits speculatively while the model is still deciding which ones it
+   * wants (`loop/retrieve.ts`, the speculative-fetch block) without re-parsing URLs back
+   * out of rendered prose. Never sent to the model — it is the same data it already has.
+   */
+  hits?: { url: string; title: string }[];
 };
 
 export type ToolFail = {

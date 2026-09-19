@@ -19,6 +19,16 @@ export const env = {
 
   llmProvider: process.env.LLM_PROVIDER ?? 'anthropic',
   llmModel: process.env.LLM_MODEL ?? 'claude-sonnet-5',
+  /**
+   * The model that CHOOSES TOOLS in Phase 1. Phase 2 — the model that writes the answer
+   * and the one `done.model` and `/health` name — stays `llmModel`.
+   *
+   * Haiku by default because Phase 1 is the whole of the TTFT problem: it picks 3-4 URLs
+   * off a rendered menu, which is a routing decision rather than a reasoning one, and the
+   * Sonnet turn measured 2.4-3.7s against a 2500ms budget for the ENTIRE request. Set this
+   * to `claude-sonnet-5` to put it back exactly as it was.
+   */
+  llmModelPhase1: process.env.LLM_MODEL_PHASE1 ?? 'claude-haiku-4-5',
 
   searchProvider: (process.env.SEARCH_PROVIDER ?? 'tavily') as 'tavily' | 'serpapi',
   searchCacheTtlSeconds: num(process.env.SEARCH_CACHE_TTL_SECONDS, 21600),

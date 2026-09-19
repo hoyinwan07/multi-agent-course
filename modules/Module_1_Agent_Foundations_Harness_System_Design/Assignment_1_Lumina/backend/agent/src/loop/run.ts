@@ -19,7 +19,7 @@ import type { SseEmitter } from '../http/sse.js';
 import { isProviderError } from '../lib/errors.js';
 import { costUsd, emptySpend, type Spend } from '../obs/cost.js';
 import { logFor } from '../obs/log.js';
-import { getLlmProvider } from '../providers/llm.anthropic.js';
+import { getLlmProvider, getPhase1LlmProvider } from '../providers/llm.anthropic.js';
 import type { LlmMessage } from '../providers/llm.js';
 import { newMemoryAccounting, newSearchAccounting, searchCachedFrom, type ToolContext } from '../tools/types.js';
 import { runDeep } from './deep.js';
@@ -78,6 +78,12 @@ export async function run(args: RunArgs): Promise<RunOutcome> {
   const gear = resolveGear(depth);
   const log = logFor(requestId, userId);
   const llm = getLlmProvider();
+  // Phase 1 chooses tools; Phase 2 writes the answer. Only Phase 2's model is what
+  // `done.model` reports and what `/health` names — the answer's model is the one a reader
+  // is asking about, and it is the one whose quality the rubric grades. See
+  // `env.llmModelPhase1`. Deep search is deliberately NOT routed here: its plan is graded
+  // by a human on whether the sub-questions are ones a person would have asked.
+  const retrieveLlm = getPhase1LlmProvider();
   const spend = emptySpend();
 
   const ctx: ToolContext = {
@@ -121,7 +127,7 @@ export async function run(args: RunArgs): Promise<RunOutcome> {
     const phase1 =
       gear.depth === 'deep'
         ? await runDeep({ query, history, gear, llm, ctx, sse, log, startedAt, toolCalls, spend })
-        : await retrieve({ query, history, gear, llm, ctx, sse, log, startedAt, toolCalls, spend });
+        : await retrieve({ query, history, gear, llm: retrieveLlm, ctx, sse, log, startedAt, toolCalls, spend });
 
     terminated = phase1.terminated;
 

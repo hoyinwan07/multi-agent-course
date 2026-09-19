@@ -27,6 +27,29 @@ import { openingUserMessage, retrieveSystemPrompt } from './prompts.js';
 const MAX_PARALLEL = 4;
 
 /**
+ * How many of the search's top hits to start fetching BEFORE the model has asked for them.
+ *
+ * This is TECHSPEC §5.2's "contingency if TTFT still misses", built once the measurement
+ * said it does: the first Phase-1 LLM turn is 2.4-3.7s and the fetches that follow it are
+ * ~0.6s, all of it serial on the critical path. Starting the likely fetches the instant
+ * `web_search` returns moves that 0.6s INTO the window where the process is blocked on the
+ * provider anyway, which is also the only window where a CPU-bound parse is free (finding
+ * 6b: `extract()` is exclusive, so the good time to run it is while nothing else can).
+ *
+ * THREE, because that is what the search tool tells the model to do — `renderHits` ends
+ * with "Call fetch_page on the 3-4 best URLs in one turn" — so speculating on the top 3
+ * maximises the chance every speculation is claimed. It is also `MIN_EVIDENCE_TO_EXIT`,
+ * so a turn whose speculations all land can reach the exit threshold without a single
+ * unspeculated fetch.
+ *
+ * COSTS NOTHING IN PROVIDER SPEND. `fetchPage` reads the page directly; the billed reader
+ * path (`fetchPageViaExtract`, $0.008) is only ever entered from `recoverRefusedFetches`.
+ * An abandoned speculation therefore costs bandwidth and one parse, not money — which is
+ * what makes speculating on a guess acceptable at all.
+ */
+const SPECULATIVE_FETCHES = 3;
+
+/**
  * Enough sources to answer from, so Phase 1 exits without spending another LLM turn
  * asking the model to confirm what the evidence already shows.
  *
@@ -205,6 +228,20 @@ export async function retrieve(args: RetrieveArgs): Promise<RetrieveOutcome> {
   const webResult = eagerByName.get('web_search');
   const docsResult = eagerByName.get('search_documents');
 
+  // ---- THE SPECULATIVE FETCHES ----
+  //
+  // Started HERE — after the search result exists, before the first LLM turn is awaited —
+  // because the whole point is that they overlap that turn. Moving this below the
+  // `llm.complete` call would make it an ordinary sequential fetch and buy nothing.
+  //
+  // Quick only, and only when the eager web search actually returned hits. See
+  // `speculateOnTopHits` for why deep is excluded and `SPECULATIVE_FETCHES` for why three.
+  const speculation =
+    subQuestion === undefined && webResult?.result.ok && webResult.result.hits?.length
+      ? speculateOnTopHits({ hits: webResult.result.hits, ctx, gear, log })
+      : null;
+  let speculationReported = false;
+
   const messages: LlmMessage[] = [
     ...history,
     {
@@ -243,7 +280,16 @@ export async function retrieve(args: RetrieveArgs): Promise<RetrieveOutcome> {
     // Per-turn LLM latency. Every turn sits inside the TTFT budget, so this is the
     // number that decides whether the three-turn shape is affordable at all.
     log.info(
-      { turn: turns, llmMs: Date.now() - turnStart, asked: reply.toolCalls.length, tokensIn: reply.usage.inputTokens },
+      {
+        turn: turns,
+        // Phase 1 may run a different model from Phase 2 (`env.llmModelPhase1`). Logged
+        // because `done.model` names the ANSWER's model, so without this line there is no
+        // record of which model actually chose the tools on a given run.
+        model: llm.model,
+        llmMs: Date.now() - turnStart,
+        asked: reply.toolCalls.length,
+        tokensIn: reply.usage.inputTokens
+      },
       'phase 1 turn'
     );
 
@@ -261,8 +307,20 @@ export async function retrieve(args: RetrieveArgs): Promise<RetrieveOutcome> {
 
     // `settled` is a PREFIX of `requested`: runBatch stops starting new chunks once a
     // provider is down, so iterate it, not `requested`, or the pairing goes out of step.
-    const settled = await runBatch(requested, ctx, gear);
+    const settled = await runBatch(requested, ctx, gear, speculation);
     toolCallCount += settled.length;
+
+    // Report the bet once, after the turn that was allowed to claim it. Speculation only
+    // ever targets the first turn — by the second the model is reacting to pages it has
+    // already read, and guessing from a stale hit list would be guessing at random.
+    if (speculation && !speculationReported) {
+      speculationReported = true;
+      const abandoned = speculation.unclaimed();
+      log.info(
+        { speculated: speculation.started, claimed: speculation.started - abandoned.length, abandoned: abandoned.length },
+        'phase 1 speculative fetch outcome'
+      );
+    }
 
     // Recover pages this turn was REFUSED, but only if losing them would starve the run.
     // Runs BEFORE the trace is emitted so a recovered page reports as the one tool call it
@@ -474,6 +532,84 @@ async function recoverRefusedFetches(args: RecoverArgs): Promise<void> {
   );
 }
 
+/**
+ * Fetches started on the search's top hits before the model asked for them.
+ *
+ * WHAT IT IS NOT: a cache. It lives for one `retrieve()` call, holds at most
+ * `SPECULATIVE_FETCHES` entries, and every entry is either claimed by the turn that
+ * follows or abandoned. Nothing here survives the request.
+ *
+ * THE ACCOUNTING RULE, which is the part that matters: a CLAIMED speculation is billed,
+ * traced and capped exactly as the ordinary `fetch_page` it replaces — same one trace
+ * step, same one slot against `gear.maxToolCalls`. An ABANDONED one is none of those
+ * things: it produced no evidence and answered no part of the question, so putting it in
+ * the trace would both misreport the model's trajectory and spend the 8-step quick
+ * envelope (`bench.mjs:673` counts trace steps) on a fetch nobody wanted. Abandonments
+ * are logged server-side instead, where they are a tuning signal rather than a claim
+ * about what the agent did.
+ */
+type Speculation = {
+  /** The settled fetch for this call, or null if it was never speculated. */
+  claim(call: { name: string; input: Record<string, unknown> }): Promise<Settled> | null;
+  /** Urls started but never claimed. Read once the first turn's batch has run. */
+  unclaimed(): string[];
+  readonly started: number;
+};
+
+/**
+ * Start fetching the top hits now, on the bet that the model will ask for them.
+ *
+ * Quick runs only. A deep sub-question divides the same 24-call ceiling up to four ways
+ * and exits at two pieces of evidence, so its margin for a wasted parse is far thinner,
+ * and deep's latency is measured at the PLAN (`deep_plan_p95_ms`, before any retrieval)
+ * rather than at first token — there is no target here for it to buy.
+ */
+function speculateOnTopHits(args: {
+  hits: { url: string }[];
+  ctx: ToolContext;
+  gear: Gear;
+  log: Log;
+}): Speculation {
+  const { hits, ctx, gear, log } = args;
+  const pending = new Map<string, Promise<Settled>>();
+  const claimed = new Set<string>();
+
+  for (const { url } of hits.slice(0, SPECULATIVE_FETCHES)) {
+    const key = url.trim();
+    if (!key || pending.has(key)) continue;
+    const t0 = Date.now();
+    // Never rejects: the same Settled union the real batch uses, so a claim can be
+    // returned straight through and a ProviderError still reaches the caller's rethrow.
+    pending.set(
+      key,
+      (async (): Promise<Settled> => {
+        try {
+          return { kind: 'ok', result: await registry.run('fetch_page', { url: key }, ctx, gear), ms: Date.now() - t0 };
+        } catch (e) {
+          return { kind: 'threw', error: e, ms: Date.now() - t0 };
+        }
+      })()
+    );
+  }
+
+  if (pending.size) log.info({ speculated: pending.size }, 'phase 1 started speculative fetches');
+
+  return {
+    started: pending.size,
+    claim(call) {
+      if (call.name !== 'fetch_page') return null;
+      const url = typeof call.input.url === 'string' ? call.input.url.trim() : '';
+      const hit = url ? pending.get(url) : undefined;
+      if (!hit) return null;
+      claimed.add(url);
+      return hit;
+    },
+    unclaimed() {
+      return [...pending.keys()].filter((u) => !claimed.has(u));
+    }
+  };
+}
+
 export type Timed = { result: ToolResult; ms: number };
 
 /** Wall clock around one registry call, so concurrent calls each report their own. */
@@ -532,13 +668,23 @@ type Settled =
 async function runBatch(
   calls: { id: string; name: string; input: Record<string, unknown> }[],
   ctx: ToolContext,
-  gear: Gear
+  gear: Gear,
+  speculation?: Speculation | null
 ): Promise<Settled[]> {
   const out: Settled[] = [];
   for (let i = 0; i < calls.length; i += MAX_PARALLEL) {
     const chunk = calls.slice(i, i + MAX_PARALLEL);
     const settled = await Promise.all(
       chunk.map(async (c): Promise<Settled> => {
+        // A page already in flight from before the model asked for it. Awaited, not
+        // re-fetched: the second request would be the wasteful one, and the page the
+        // model is about to read must be the page we actually retrieved.
+        //
+        // `ms` stays the speculation's REAL duration rather than the ~0 the request waited,
+        // because the trace answers "how long did reading this page take", not "how much of
+        // it landed on the critical path". A 0ms fetch in a trace would read as a bug.
+        const claimed = speculation?.claim(c);
+        if (claimed) return claimed;
         const t0 = Date.now();
         try {
           return { kind: 'ok', result: await registry.run(c.name, c.input, ctx, gear), ms: Date.now() - t0 };

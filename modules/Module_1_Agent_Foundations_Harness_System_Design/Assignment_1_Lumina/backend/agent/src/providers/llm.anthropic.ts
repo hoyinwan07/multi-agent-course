@@ -105,6 +105,19 @@ const usageOf = (u: Anthropic.Usage): LlmUsage => ({
   outputTokens: u.output_tokens ?? 0
 });
 
+/**
+ * Whether this model accepts `output_config.effort` and an explicit `thinking` block.
+ *
+ * Haiku 4.5 accepts NEITHER: `output_config.effort` is rejected outright, and its only
+ * thinking mode is `{type:'enabled', budget_tokens:N}` — omitting the field is how you get
+ * a non-thinking turn, which is exactly what Phase 1 wants. Sending the Sonnet shape at it
+ * is a 400, not a degraded answer, so this is a correctness check and not a tuning knob.
+ *
+ * Written as "which models take the Sonnet/Opus shape" rather than a Haiku denylist so a
+ * future `claude-haiku-*` inherits the right behaviour without another edit here.
+ */
+const takesEffortAndThinking = (model: string): boolean => !/^claude-haiku-/.test(model);
+
 export class AnthropicProvider implements LlmProvider {
   readonly model: string;
   private readonly effort: Effort;
@@ -112,6 +125,17 @@ export class AnthropicProvider implements LlmProvider {
   constructor(model = env.llmModel, effort: Effort = 'low') {
     this.model = model;
     this.effort = effort;
+  }
+
+  /**
+   * The per-model half of a request. Spread into both `complete` and `stream` so the two
+   * paths cannot drift — a shape that 400s on one and not the other is the bug this
+   * prevents.
+   */
+  private tuning(): Record<string, unknown> {
+    return takesEffortAndThinking(this.model)
+      ? { thinking: { type: 'disabled' }, output_config: { effort: this.effort } }
+      : {};
   }
 
   async complete(req: LlmCompleteRequest): Promise<LlmReply> {
@@ -123,8 +147,7 @@ export class AnthropicProvider implements LlmProvider {
           // Phase 1 emits tool calls, not prose. A big ceiling here buys nothing and
           // gives a confused model room to write an essay instead of calling a tool.
           max_tokens: req.maxTokens ?? 1536,
-          thinking: { type: 'disabled' },
-          output_config: { effort: this.effort },
+          ...this.tuning(),
           // NO `temperature` HERE, and it is not an oversight: Sonnet 5 rejects it with
           // `400 temperature is deprecated for this model`. It is worth recording why it
           // was wanted, because the reason has not gone away — the bench asks the same 20
@@ -170,8 +193,7 @@ export class AnthropicProvider implements LlmProvider {
       {
         model: this.model,
         max_tokens: req.maxTokens ?? 1600,
-        thinking: { type: 'disabled' },
-        output_config: { effort: this.effort },
+        ...this.tuning(),
         system: toSdkSystem(req.system),
         messages: toSdkMessages(req.messages)
       },
@@ -201,8 +223,23 @@ export class AnthropicProvider implements LlmProvider {
 }
 
 let singleton: LlmProvider | null = null;
+let phase1Singleton: LlmProvider | null = null;
 
 export function getLlmProvider(): LlmProvider {
   if (!singleton) singleton = new AnthropicProvider();
   return singleton;
+}
+
+/**
+ * The Phase 1 (tool-choosing) provider. Separate instance, possibly a different model —
+ * see `env.llmModelPhase1`.
+ *
+ * Returns the SAME object as `getLlmProvider()` when the two models match, so setting
+ * `LLM_MODEL_PHASE1=claude-sonnet-5` restores the single-model behaviour exactly, down to
+ * sharing one client and one prompt cache namespace.
+ */
+export function getPhase1LlmProvider(): LlmProvider {
+  if (env.llmModelPhase1 === env.llmModel) return getLlmProvider();
+  if (!phase1Singleton) phase1Singleton = new AnthropicProvider(env.llmModelPhase1);
+  return phase1Singleton;
 }

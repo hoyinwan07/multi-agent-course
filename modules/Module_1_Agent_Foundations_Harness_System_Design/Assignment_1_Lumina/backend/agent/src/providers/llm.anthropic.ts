@@ -135,7 +135,18 @@ export class AnthropicProvider implements LlmProvider {
   private tuning(): Record<string, unknown> {
     return takesEffortAndThinking(this.model)
       ? { thinking: { type: 'disabled' }, output_config: { effort: this.effort } }
-      : {};
+      : // Haiku 4.5: `effort` is a 400 ("This model does not support the effort
+        // parameter" — probed against the live API, not assumed), `thinking: disabled` is
+        // accepted, and `temperature` IS allowed.
+        //
+        // `temperature: 0` is the point of this branch, not an afterthought. The search
+        // cache gate is really a determinism gate: the bench asks the same 20 questions
+        // twice and needs EVERY repeat to report `searchCached`, so a run that refines its
+        // search has to word the refinement identically both times or the repeat misses a
+        // cache key the fresh pass already warmed. Sonnet 5 rejects `temperature` outright,
+        // which is why the comment below says the reason "has not gone away" — routing
+        // Phase 1 to Haiku is what finally makes it reachable.
+        { thinking: { type: 'disabled' }, temperature: 0 };
   }
 
   async complete(req: LlmCompleteRequest): Promise<LlmReply> {

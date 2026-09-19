@@ -2,38 +2,74 @@
 
 ## READ THIS FIRST — exact resume point
 
-**Submitted 2026-09-18.** Live at **https://hw-lumina-beta.vercel.app** — `/` works for a
+**Submitted 2026-09-18. Now 75/100, last measured 2026-09-19.** Live at **https://hw-lumina-beta.vercel.app** — `/` works for a
 stranger, `/evals` renders a real report built from a real deployed run.
 
-### ⏭️ THE NEXT SESSION'S JOB, in one line
+### ⏭️ THE NEXT SESSION'S JOB
 
-**Deploy the agent, run one full bench, rebuild the report, redeploy the gateway** — then
-read the four rows in "Fast-follow #5" below. Fast-follow #5 is **committed and typechecked
-but NOT deployed and NOT bench-measured**; `/evals` is still showing the 68/100 run from
-before it. Nothing else is worth starting until that number exists.
+**Fast-follow #5 is DONE, deployed, bench-measured and live. Score 68 → 75/100.** The cache
+row passed and is now worth nothing more to chase. What is left, in value order:
+
+1. **`quickBudget` — 3.33 pts, the only automated item still reachable by code.** 3/75 quick
+   runs over $0.05 or 8 tool calls, down from 7/75. Read those three runs out of `runs/`
+   before changing anything: two of the earlier over-budget runs were genuine multi-403
+   turns, not loop-logic bugs.
+2. **The instructor message — up to ~18 pts and no code.** A2 (worth 3.33 and an automatic
+   fail, blocked by the rubric conflict written up below) and the stretch bonus (15 pts,
+   in `rubric.json` but in no scorer). Both need a person, not a commit.
+3. **The video — 5 manual pts**, never recorded. Part of the deploy/docs row.
+
+**Do NOT reopen latency.** See the box below; it is settled with a deployed measurement.
+
+### ⛔ ttft is settled — do not spend another session on it
+
+Measured deployed on 2026-09-19 with speculative fetch AND Haiku Phase 1 both live:
+
+```
+ttft p50 = 3540ms     ttft p95 = 8334ms     target = 2500ms
+```
+
+**Even the median misses.** This supersedes both earlier positions in this file: the
+original "latency is worth ZERO points" box reached the right conclusion by the wrong
+route, and the retraction that replaced it was over-optimistic arithmetic (it predicted
+~1.9s, then ~2.3s with Haiku). The Phase-1 turn DID move — Sonnet 2.4-3.7s → Haiku ~1.5s
+measured deployed — and it was not enough, because p95 is driven by slow pages that
+speculation can only partly hide (`max(turn, fetch)`, and a 6s page started at 0.3s still
+lands at 6.3s).
+
+`bench.pass` is therefore unreachable, and with it one third of the Performance & SLA row.
+**The row is NOT all-or-nothing though** — `build-report.mjs:242` scores it
+`round(passed/3 × 10)`, so `quickBudget` alone is worth 3.33 of it. That is item 1 above.
+
+### The regen chain, for whenever a number needs re-measuring
 
 ```bash
-# from the assignment root — the full chain, ~15 min, ~$2-3
+# from the assignment root — ~15 min, ~$2-3. Ran clean on 2026-09-19.
 export FLYCTL_INSTALL="/Users/hoyinwan/.fly"; export PATH="$FLYCTL_INSTALL/bin:$PATH"
 flyctl deploy -c fly.agent.toml --ha=false --no-public-ips
 flyctl ips list -a lumina-agent-hoyinwan            # MUST print nothing
 cd backend/agent && npx tsx src/dev/try-cache.ts --purge && cd ../..
-cp reports/bench.json reports/bench.prev.json       # see "no baseline in git" below
+cp reports/bench.json reports/bench.prev.json       # reports/ is gitignored; keep a baseline
 node benchmark/bench.mjs --target https://lumina-gateway-hoyinwan.fly.dev
 node scripts/export-runs.mjs && node quality/check.mjs .
 # then eval/build-report.mjs — full invocation under "Where the real report lives"
-flyctl deploy -c fly.gateway.toml --ha=false
+flyctl deploy -c fly.gateway.toml --ha=false        # or /evals keeps the OLD report
 ```
 
-**Before you run it, check one thing that will otherwise waste the whole bench:** confirm
-Phase 1 is actually on Haiku in the deployed agent. `LLM_MODEL_PHASE1` defaults to
-`claude-haiku-4-5` in `env.ts` (committed, no secret needed), but if a Fly secret of that
-name was ever set to something else it wins. After the first request, the agent log line
-`phase 1 turn` carries `model` — it must read `claude-haiku-4-5`.
+**`--smoke` first, when the question is latency-shaped.** `node benchmark/bench.mjs --smoke`
+is 5 queries (`bench.mjs:259`), about **$0.20** against the full run's $2-3, and it reads
+deployed ttft honestly. That is what settled the ttft question on 2026-09-19 for a tenth of
+the cost — reach for it before committing to a full bench.
 
-### Fast-follow #5 — built this session, NOT yet measured
+**Sanity check that would otherwise waste a whole bench:** confirm Phase 1 is really on
+Haiku. `LLM_MODEL_PHASE1` defaults to `claude-haiku-4-5` in `env.ts` (committed, no secret
+needed), but a Fly secret of that name would win. The agent log line `phase 1 turn` carries
+`model` — it must read `claude-haiku-4-5`.
 
-Commit `8ca5ae4`. Two changes, both aimed at ttft, both off the critical path:
+### Fast-follow #5 — DONE and measured (`8ca5ae4` + `1f43081`)
+
+Commits `8ca5ae4` (speculative fetch + Haiku Phase 1) and `1f43081` (`temperature: 0`).
+Three changes; the one that scored was the third, and it only works because of the second:
 
 1. **Speculative fetch.** `web_search` now returns structured `hits`; Phase 1 starts
    fetching the top 3 the instant the search returns, concurrently with the first LLM turn.
@@ -42,27 +78,29 @@ Commit `8ca5ae4`. Two changes, both aimed at ttft, both off the critical path:
 2. **Phase 1 on Haiku 4.5.** `LLM_MODEL_PHASE1` (default `claude-haiku-4-5`). Phase 2 — the
    model that writes the answer, and what `done.model` and `/health` name — stays Sonnet 5.
 
-**The four rows to watch, and what would count as #5 working:**
+**What #5 actually did, measured** (full bench, cache purged first, 2026-09-19):
 
-| row | last measured | #5 lands if |
-|---|---|---|
-| ttft p95 | 11060ms | **≤2500ms** — the whole point, and the least likely |
-| answer p95 | 15389ms | ≤12000ms — should move with ttft |
-| deep plan p95 | 4554ms | ≤4000ms — **untouched by #5**, see below |
-| search cache | 47.5% | ≥50% — **untouched by #5**, needs Lever 1 |
+| row | before | after | |
+|---|---|---|---|
+| **search cache** | 47.5% | **50% — PASS** | 20/20 repeats hit. **Search & cited answers 13/20 → 20/20, +7 pts** |
+| `quickBudget` | 7/75 | **3/75** | real movement, still needs zero |
+| ttft p95 | 11060ms | 8334ms | −25%, and still 3.3× the target |
+| answer p95 | 15389ms | 13780ms | still over 12000 |
+| deep plan p95 | 4554ms | 5406ms | **worse** — 4 samples, Sonnet variance, not a #5 regression (#5 never touched deep) |
+| cost/quick | $0.0342 | $0.0328 | Haiku Phase 1 |
 
-> **Do not expect `bench.pass` to flip.** It needs ALL FOUR of those passing at once
-> (`benchmark/bench.mjs:1007`). #5 targets the first two only. Even a large ttft
-> improvement leaves deep plan p95 and the cache row failing, and the 10-point
-> Performance & SLA row scores zero until every one of them passes.
+**The cache row is the win, and `temperature: 0` is why.** The gate needs EVERY one of the 20
+repeats to report `searchCached`, and the failure mode was a refinement worded differently on
+the repeat than on the fresh pass, missing a key the fresh pass had already warmed. Sonnet 5
+rejects `temperature`; Haiku 4.5 accepts it (probed live, see `5b`). Routing Phase 1 to Haiku
+is what made determinism reachable — the two changes only work together.
 
-**The honest caveat on Haiku, recorded because it is easy to over-read the commit message:**
-measured on a laptop, Haiku's Phase-1 turn (1861-2644ms) is **barely faster than Sonnet's**
-(2260ms). Most of that number is network round-trip to the API, not model compute. The
-separation should appear deployed in `iad`, but that is an assumption, not a measurement —
-the deployed bench is what decides it. If Haiku turns out to be no faster deployed, set
-`LLM_MODEL_PHASE1=claude-sonnet-5` and keep the speculative fetch, which is independently
-verified.
+**Haiku's gain is real but was invisible locally — a measurement trap worth remembering.**
+On a laptop, Haiku's Phase-1 turn (1861-2644ms) looked no faster than Sonnet's (2260ms),
+because most of that number is network round-trip to the API rather than model compute.
+Deployed in `iad` the same turn measures **~1.5s** (1247/1308/1341/1508/1667/1679/2758ms
+observed) against Sonnet's documented 2.4-3.7s. **Do not judge a model-latency change from
+this laptop; deploy and read the agent log.**
 
 **Two gotchas in this change, both already handled — do not "fix" them back:**
 - **Haiku 4.5 rejects `output_config.effort` outright and takes no adaptive thinking.**
@@ -88,50 +126,21 @@ have asked" (`eval/rubric.json:83`), and `min_deep_sub_questions` / `min_deep_so
 both key off it. That is a real trade against 5 manual points; it needs a decision, not a
 default.
 
-### ⚠️ RETRACTED — the "latency is worth ZERO points" box that used to lead this file
+### The two superseded positions on latency, kept so nobody re-derives either
 
-Every earlier version of this handoff opened by asserting that `bench.pass` can **never** be
-true, because `ttft_p95_ms` is 2500 against a measured ~4.7s floor, and therefore all latency
-work is worth zero. **That conclusion was wrong, and it was steering the next session away
-from the single largest item on the board.** The error was treating the 2.4–3.7s Phase-1 LLM
-turn as immovable. It is not immovable — it only has to come off the *critical path*.
+This file has twice been wrong about ttft in opposite directions, and both are worth
+knowing before anyone reopens it:
 
-```
-0.3s  eager recall + search
-2.4-3.7s  Phase-1 LLM planning turn   <- the ONLY part that busts 2500ms
-0.6s  parallel fetches
-1.0s  synthesis first token
-```
+1. **"Further latency work is worth ZERO points"** (original). Right conclusion, wrong
+   reason — it assumed the 2.4-3.7s Phase-1 turn was immovable. It was not: Haiku moved it
+   to ~1.5s.
+2. **"ttft is reachable, `bench.pass` is back in play"** (the 2026-09-19 retraction). Wrong.
+   The arithmetic — `0.3 eager + 0.6 fetch + 1.0 synthesis ≈ 1.9s`, later ~2.3s with Haiku —
+   ignored how much larger eager search and synthesis-to-first-token are deployed, and that
+   p95 is set by slow pages rather than by the floor. Measured: p50 3540ms, p95 8334ms.
 
-Eager-search → eager-fetch the top hits → start streaming synthesis from that fetched text,
-and run the Phase-1 turn *in parallel* rather than ahead of it: **0.3 + 0.6 + 1.0 ≈ 1.9s**,
-under the 2500ms target. This is the same "overlap Phase-1 with an eager fetch" lever noted
-further down this file — what was missed is that it is worth **points**, not just a nicer
-product.
-
-**Why this is spec-compliant, checked against the instructor's own files:**
-- `SPEC.md:106` (Must) requires synthesis from **fetched page text, not snippets alone**. The
-  eager-fetch path still fetches and reads pages, so it satisfies this. A snippet-only
-  pipeline does NOT — it is explicitly "scored down". Do not go there to buy latency.
-- `SPEC.md:145`'s "the `plan` event is emitted before any retrieval" is **deep-only** — it is
-  deep's first paint, governed by `deep_plan_p95_ms`. Quick search has no such requirement.
-- `sla.json`'s own note on `ttft_p95_ms` reads *"quick search: the 'it's thinking' window"* —
-  **ttft is measured on quick only**, and quick is free to retrieve before it plans.
-- `SPEC.md:92`'s "One loop: plan → choose tool → observe" is what makes the LLM-turn-first
-  reading feel mandatory. It is the literal reading, and it is the expensive one.
-
-> **HARD CONSTRAINT on this change — do not break `save_memory`.** `benchmark/bench.mjs:736`
-> sends "Remember this preference…" as an ordinary **quick web** query and requires a
-> `save_memory` step in the trace. Phase 1 therefore cannot be deleted or short-circuited:
-> the model must still get its turn. The eager fetch has to run **in parallel with** Phase 1,
-> never instead of it. Get this wrong and the memory row goes 10/10 → 0 and three metrics
-> fail at once.
-
-**Consequence: the 10-point Performance & SLA row is back in play.** It is still all-or-
-nothing on `bench.pass` (`benchmark/bench.mjs:1007` — `slaRows.every(r => r.pass)` plus the
-contract probes), so it needs ttft **and** answer p95 (15389 → ≤12000) **and** deep plan p95
-(4554 → ≤4000) **and** cache (47.5% → ≥50%) all passing together. That is a real lift, not a
-quick win. But "worth zero" is false, and it was the first thing anyone read.
+The settled position is the ⛔ box at the top of this file, and it rests on a deployed
+measurement rather than on either estimate.
 
 ---
 
@@ -227,7 +236,7 @@ the drop and blames TTL expiry between runs. **That hypothesis is wrong** in the
 Mongo-TTL one was: the mechanism is the *fresh* pass being pre-warmed, not the repeat pass
 expiring. The artifact is otherwise accurate on #1 and #2 and is worth reading for those.
 
-### The next session's job — two levers, in this order
+### Levers as of #4 (superseded — Lever 1 and 2 are DONE, see the top of this file)
 
 **Lever 1 (cheap, ~7 pts + ~3.3 pts): kill the last refinement.** The cache row needs **one**
 repeat query to stop refining. Do not re-run a bench to find it — this bench's runs are
@@ -256,10 +265,11 @@ Order: **bench #5 first** (it is already built and the number is missing), then 
 (cheap, no code), then Lever 1 (a trace read).
 
 **State of the submission right now (after fast-follows #1, #1b, #2, #3a, #3b, #4, #4b):**
-- Score: **68/100**, measured 2026-09-19 and live on `/evals`. State it this way, not as
-  "68/85" — 85 is only the automated ceiling, and the other 15 are manual rows a grader
-  awards. The +2 over the previous 66 is the deep cap+1 429 probe, which #3b fixed for free.
-  The 17 missing automated points are itemised under "What is actually worth points".
+- Score: **75/100**, measured 2026-09-19 after fast-follow #5 and live on `/evals`. State it
+  this way, not as "75/85" — 85 is only the automated ceiling, and the other 15 are manual
+  rows a grader awards. Progression: 66 → 68 (deep cap+1 429, fixed free by #3b) → **75**
+  (the cache row, #5). The 10 missing automated points are the whole Performance & SLA row:
+  `bench.pass` (dead, ttft), `quickBudget` (3/75, reachable) and `quality.errors` (A2).
 - 15 manual points open for a grader, **1 red line still crossed (A2) — but from history
   only**, see the box above. Zero runs of current code cap.
 - Git: `main` == `8ca5ae4` (fast-follow #5). **`reports/` and `runs/` are gitignored**
@@ -343,12 +353,15 @@ SSE-event-timestamping and is quick to rewrite (POST /threads, POST /ask, record
 clock of every `trace`/`sources`/`token`/`done` event, diff consecutive marks — the gaps
 between traces ARE the LLM turns).
 
-### What is actually worth points — the 17 missing automated points, itemised
+### What is actually worth points — the 10 missing automated points, itemised
 
 Read straight off the last report (`reports/report.json`), most valuable first:
 
-1. **~7 pts · Search & cited answers 13/20** — the one failing part is
-   `search cache hit rate` **47.5%** as of 2026-09-19 (was 45%; target ≥50%). **This is not a
+1. **~7 pts · Search & cited answers — RESOLVED 2026-09-19, now 20/20.** `search cache hit
+   rate` reached **50%** (20/20 repeats) once Phase 1 ran on Haiku with `temperature: 0`.
+   The diagnosis below is kept because it is what led to the fix, and because the mechanism
+   is fragile: the gate has zero margin by construction, so ONE refinement worded differently
+   on a repeat puts this row back to 13/20. **This is not a
    caching bug, and the
    hypothesis recorded here before (Mongo TTL expiry) is wrong.** `done.searchCached` is
    `searchCachedFrom()` in `tools/types.ts:91`: `searches > 0 && searches === searchHits` —

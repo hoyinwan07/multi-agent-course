@@ -6,56 +6,143 @@
 stranger, `/evals` renders a real report built from a real deployed run. Everything is
 committed and pushed; nothing is hanging mid-flight.
 
-**Fast-follow #3 (ttft/latency) is DONE — and it turned up the thing that should drive
-every decision from here:**
+### ⚠️ RETRACTED — the "latency is worth ZERO points" box that used to lead this file
 
-> **Further latency work is worth ZERO points.** `eval/build-report.mjs:208` scores the
-> 10-point Performance & SLA row as three equal parts, and the first is
-> `bench.pass === true` — i.e. **every** target in `sla.json` met, all or nothing.
-> `ttft_p95_ms` is 2500 and the measured floor is ~4.7s (0.3s eager + **2.4s Phase-1 LLM
-> turn** + 0.6s fetch + 1.0s synthesis first token, on a warm cache with fast pages), so
-> `bench.pass` can never be true. That makes ttft p95, answer p95, deep plan p95 AND the
-> search-cache-hit-rate target all worth nothing **through that row**. Spending another
-> session shaving seconds buys a better product and zero score.
+Every earlier version of this handoff opened by asserting that `bench.pass` can **never** be
+true, because `ttft_p95_ms` is 2500 against a measured ~4.7s floor, and therefore all latency
+work is worth zero. **That conclusion was wrong, and it was steering the next session away
+from the single largest item on the board.** The error was treating the 2.4–3.7s Phase-1 LLM
+turn as immovable. It is not immovable — it only has to come off the *critical path*.
 
-**Fast-follow #4 (the refinement leak) is BUILT and deployed but NOT yet measured at bench
-scale.** The next session's job is exactly one thing: **purge the search cache, run one full
-bench, rebuild the report, redeploy the gateway.** Nothing else is worth starting before
-that number exists. Read, in this order: "BEFORE YOU RUN THE BENCH" (a real measurement
-trap — skip it and the cache number is fake), "Where the real report lives" (the regen
-chain), then "Where #4 stands" for what to expect.
+```
+0.3s  eager recall + search
+2.4-3.7s  Phase-1 LLM planning turn   <- the ONLY part that busts 2500ms
+0.6s  parallel fetches
+1.0s  synthesis first token
+```
 
-**The four rows to watch, and what would count as #4 working:**
-| row | now | #4 lands if |
-|---|---|---|
-| search cache hit rate | 45% | **≥50%** — needs every repeat to avoid refining |
-| `quickBudget` | 11/75 over | fewer; modelled 63/375 → 60 |
-| quality errors (A2) | 1 error | unchanged by #4; separate problem |
-| deep cap+1 429 | timed out | may pass free on 2 vCPUs — cheapest 2 pts on the board |
+Eager-search → eager-fetch the top hits → start streaming synthesis from that fetched text,
+and run the Phase-1 turn *in parallel* rather than ahead of it: **0.3 + 0.6 + 1.0 ≈ 1.9s**,
+under the 2500ms target. This is the same "overlap Phase-1 with an eager fetch" lever noted
+further down this file — what was missed is that it is worth **points**, not just a nicer
+product.
 
-If the cache row clears 50%, that is ~7 points and the single biggest recoverable item.
-If it does not, the refinement rate is still above zero — get it from `runs/` for free
-(count `web_search` per run) before changing any code.
+**Why this is spec-compliant, checked against the instructor's own files:**
+- `SPEC.md:106` (Must) requires synthesis from **fetched page text, not snippets alone**. The
+  eager-fetch path still fetches and reads pages, so it satisfies this. A snippet-only
+  pipeline does NOT — it is explicitly "scored down". Do not go there to buy latency.
+- `SPEC.md:145`'s "the `plan` event is emitted before any retrieval" is **deep-only** — it is
+  deep's first paint, governed by `deep_plan_p95_ms`. Quick search has no such requirement.
+- `sla.json`'s own note on `ttft_p95_ms` reads *"quick search: the 'it's thinking' window"* —
+  **ttft is measured on quick only**, and quick is free to retrieve before it plans.
+- `SPEC.md:92`'s "One loop: plan → choose tool → observe" is what makes the LLM-turn-first
+  reading feel mandatory. It is the literal reading, and it is the expensive one.
 
-Full audit of the earlier fast-follows, with before/after numbers and root causes, is
-written up as an artifact: **https://claude.ai/artifact/H2rjHxKGDpeZeBjjnW2xsh** (predates
-#3 — the priority list in this file supersedes it).
+> **HARD CONSTRAINT on this change — do not break `save_memory`.** `benchmark/bench.mjs:736`
+> sends "Remember this preference…" as an ordinary **quick web** query and requires a
+> `save_memory` step in the trace. Phase 1 therefore cannot be deleted or short-circuited:
+> the model must still get its turn. The eager fetch has to run **in parallel with** Phase 1,
+> never instead of it. Get this wrong and the memory row goes 10/10 → 0 and three metrics
+> fail at once.
 
-**State of the submission right now (after fast-follows #1, #1b, #2, #3a, #3b):**
-- Score: **66/85 automated** as last measured. #3 did not change it and was never going to
-  (see the box above); it will change only if fast-follow #4 lands. The 19 missing points
-  are itemised under "What is actually worth points".
-- 15 manual points open for a grader, **1 red line still crossed (A2)** — see #2 below for
-  how much the underlying cap rate moved even though the red line itself is still crossed.
-- Git: local `main` and `mine/2026-03-hoyinwan/lumina-week1` are identical at `046bce2`.
-  Everything is pushed. Nothing uncommitted except 2 harmless untracked stray
-  `package-lock.json` files (see Git state below).
-- Deploy: agent is at **Fly release v11** (#3a, #3b, #4, #4b all baked in), and the machine
-  is now **2 shared vCPUs, not 1** (`fly.agent.toml`). Gateway still carries the bench run
-  from before #3 — `/evals` is therefore showing pre-#3 numbers, which is correct, since no
-  bench has been run since. Vercel unchanged, still live.
+**Consequence: the 10-point Performance & SLA row is back in play.** It is still all-or-
+nothing on `bench.pass` (`benchmark/bench.mjs:1007` — `slaRows.every(r => r.pass)` plus the
+contract probes), so it needs ttft **and** answer p95 (15389 → ≤12000) **and** deep plan p95
+(4554 → ≤4000) **and** cache (47.5% → ≥50%) all passing together. That is a real lift, not a
+quick win. But "worth zero" is false, and it was the first thing anyone read.
 
-### Where #4 stands — built, probed, NOT bench-measured
+---
+
+**Fast-follow #4 IS NOW MEASURED. Score moved 66 → 68.** The purge → bench → report →
+redeploy chain was run on 2026-09-19 against the deployed gateway, and `/evals` is live on
+those numbers. What the run settled:
+
+| row | before | **measured now** | verdict |
+|---|---|---|---|
+| search cache hit rate | 45% | **47.5%** (19/40) | #4 halved the leak — 2 repeats refined → **1** — but the gate is ≥50% and the ceiling is 50%, so one repeat still costs the whole row |
+| `quickBudget` | 11/75 over | **7/75 over** | real improvement, not yet zero |
+| deep cap+1 429 | timed out | **PASSES** | #3b's second vCPU did it. Deep search **13/15 → 15/15**, the +2 points |
+| quality errors (A2) | 1 error | **1 error, but 0 of it from this run** | see below — this is the finding of the session |
+
+**The A2 red line is now entirely historical.** All **151 runs this bench produced
+terminated `done`** — zero caps, zero errors, including all 4 deep runs (deep cap rate
+4/4 → 1/4 → **0/4**). `quality/check.mjs` still reports the error because it reads
+accumulated history in `runs/`, which holds pre-fix runs going back to before #1. The
+current code no longer produces the behaviour the rule is catching.
+
+> **Judgment call left open deliberately, for a human.** `runs/` is 737 files; only ~500 come
+> from the deployed Mongo collection. Clearing that history would take A2 to clean and
+> `quality.errors` to 0 — worth ~3.3 pts — but "delete the logs until the red line clears"
+> is exactly the shape of gaming that `DESIGN.md`'s Trade-offs #3 and the eval skill's
+> "do not edit the grader" rule reject. It was NOT done. Decide it explicitly, in writing,
+> before anyone touches `runs/`.
+
+### The 75 was never real — settle this before ever "reverting to the first version"
+
+The score history reads 75 → 73 → 66 → 68, which looks like every fix made things worse. It
+did not. **The 75 was measured on a pre-warmed cache and was not achievable on a clean run.**
+
+This is arithmetic, not interpretation. From `benchmark/bench.mjs:262-267`:
+
+```js
+const repeats = Math.round(total * (W.repeat_fraction ?? 0.5));  // 20 of 40
+const fresh   = total - repeats;                                  // 20
+for (let i = 0; i < repeats; i++) out.push(out[i % Math.max(1, fresh)]);  // repeats ARE the fresh queries
+```
+
+and the rate is computed over **all 40 runs** (`bench.mjs:847-848`), not just the repeats.
+On a cold cache the 20 fresh queries *must* miss — it is the first time those strings are
+ever searched. **The mathematical ceiling is 20/40 = 50%**, against a gate of ≥50%.
+
+So a recorded **92.5% (37/40) is impossible on a cold cache** — it proves 17 of the 20
+"fresh" queries were already warm from a bench run inside the 6h `SEARCH_CACHE_TTL_SECONDS`
+window. That single row is worth ~7 points, which is the whole 75 → 68 gap.
+
+**Therefore: reverting the code cannot restore 75.** The code never produced it; a second
+bench run within six hours did. Today's build measured under those same inflated conditions
+would land around 75-77 (it also now passes the deep cap+1 probe that the 75 run did not).
+Re-running warm to "get the number back" is exactly the dishonest measurement that
+"BEFORE YOU RUN THE BENCH" below exists to prevent. Don't.
+
+The earlier audit artifact — **https://claude.ai/artifact/H2rjHxKGDpeZeBjjnW2xsh** — records
+the drop and blames TTL expiry between runs. **That hypothesis is wrong** in the same way the
+Mongo-TTL one was: the mechanism is the *fresh* pass being pre-warmed, not the repeat pass
+expiring. The artifact is otherwise accurate on #1 and #2 and is worth reading for those.
+
+### The next session's job — two levers, in this order
+
+**Lever 1 (cheap, ~7 pts + ~3.3 pts): kill the last refinement.** The cache row needs **one**
+repeat query to stop refining. Do not re-run a bench to find it — this bench's runs are
+already in `runs/`, and 13 of the 111 quick-shaped runs (11.7%) issued a second `web_search`.
+**Every one of those 13 cost $0.054–$0.079, i.e. all of them also blew the $0.05 quick
+budget.** Same runs, both rows: cache hit rate and `quickBudget` are **one bug, not two**.
+Identify which of the 20 repeat queries refined, read its trace, fix that trigger.
+
+**Lever 2 (harder, unlocks the 10-pt row): get the Phase-1 turn off the critical path.** See
+the retraction box at the top. This is what makes `bench.pass` reachable at all, and it may
+also cut refinements further (a run that never needs a second round never issues a second
+search), so it partly subsumes Lever 1.
+
+Do Lever 1 first — it is a trace read, not an architecture change — then re-bench before
+starting Lever 2, so the two effects stay separable.
+
+**State of the submission right now (after fast-follows #1, #1b, #2, #3a, #3b, #4, #4b):**
+- Score: **68/100**, measured 2026-09-19 and live on `/evals`. State it this way, not as
+  "68/85" — 85 is only the automated ceiling, and the other 15 are manual rows a grader
+  awards. The +2 over the previous 66 is the deep cap+1 429 probe, which #3b fixed for free.
+  The 17 missing automated points are itemised under "What is actually worth points".
+- 15 manual points open for a grader, **1 red line still crossed (A2) — but from history
+  only**, see the box above. Zero runs of current code cap.
+- Git: `main` == `mine/2026-03-hoyinwan/lumina-week1` == `f181eaa`; the only uncommitted
+  change is this file. `reports/` and `runs/` are gitignored, so the rebuilt report and the
+  ~150 new run logs exist **only on this machine and inside the deployed image** — they are
+  not recoverable from git if lost. See Git state below.
+- Deploy: agent at **Fly release v11** (#3a, #3b, #4, #4b baked in), **2 shared vCPUs**
+  (`fly.agent.toml`). **Gateway redeployed 2026-09-19** with this run's `reports/report.json`
+  baked in — verified live: `GET /evals/report.json` returns `awarded: 68`,
+  `searchCacheHitRatePct: 47.5`, `deployedAt: 2026-09-19T00:12:06Z`. Vercel unchanged.
+
+### Where #4 stands — MEASURED 2026-09-19 (this section kept for the before/after)
 
 Two commits, `c808ead` (denylist) and `046bce2` (reader fallback). They split the problem:
 the list handles the 12 hosts measured refusing us, the fallback handles the ones nobody
@@ -66,11 +153,11 @@ What a cheap probe showed (12 runs, ~$0.35, not a bench):
   query used to 403 on investing.com and refine every time.
 - cost per repeat **$0.043-0.048 → $0.031-0.037**.
 
-**What has NOT been shown**: that `search cache hit rate` clears 50% over the real 40-query
-workload, or that `quickBudget` improved. Both need `node benchmark/bench.mjs`. The gate has
-zero margin by construction (20 fresh + 20 repeats, ceiling 50%, gate ≥50%), so it clears
-only if EVERY repeat avoids refining — a 9.9% historical refinement rate was exactly the
-2 runs that made it 45%.
+**What the full bench then showed** (2026-09-19, cache purged first): the probe's direction
+was right, its magnitude optimistic. `search cache hit rate` **45% → 47.5%** — one repeat
+still refines where two did before — and `quickBudget` **11/75 → 7/75**. The gate has zero
+margin by construction (20 fresh + 20 repeats, ceiling 50%, gate ≥50%), so **47.5% scores
+exactly as badly as 45%**: the row needs the last refinement gone, not a smaller one.
 
 **Also not shown: the reader fallback firing in a live run.** It is unit-tested against four
 really-blocked hosts (50-220ms, 0 markdown links left, 0 broken segments) but the denylist
@@ -79,8 +166,16 @@ real exercise when a host that is not on the list starts refusing us. If you wan
 it, comment out an entry in `blockedHosts.ts` and ask something that surfaces that host.
 
 **The cheap tools built this session, worth reusing before spending $2-3 on a bench:**
-- Refinement rate, free, from existing logs: count `web_search` per run over `runs/*.json`.
-  9.9% (37/375) was the number that predicted the 45% exactly.
+- Refinement rate, free, from existing logs. **A run log has NO `depth`/`mode` field** — the
+  shape is `{tokens, wallClockSec, costUsd, terminated, toolCalls:[{name, ok, ms, error}]}`,
+  so filter quick-shaped runs by `toolCalls.length <= 8` (the quick call cap). This exact
+  command reproduces the historical 37/375 = 9.9%:
+  ```bash
+  node -e "const fs=require('fs');let q=0,m=0;for(const f of fs.readdirSync('runs').filter(x=>x.endsWith('.json'))){let r;try{r=JSON.parse(fs.readFileSync('runs/'+f,'utf8'))}catch{continue}const tc=r.toolCalls||[];const ws=tc.filter(t=>t.name==='web_search').length;if(ws<1||tc.length>8)continue;q++;if(ws>1)m++;}console.log(m+'/'+q,((m/q)*100).toFixed(1)+'%')"
+  ```
+  To isolate ONE bench instead of accumulated history, snapshot `ls runs/*.json` before the
+  run and `comm -13` it against the list afterwards — `export-runs.mjs` re-pulls the whole
+  Mongo collection, so `runs/` always mixes old and new.
 - `npx tsx src/dev/try-fetch-latency.ts` from `backend/agent/` — per-page fetch cost and
   captured token count. Run it after touching the parse path; the token counts must not move.
 - `npx tsx src/dev/try-cache.ts` — proves the cache layer itself (key, rows, TTL sweep).
@@ -113,12 +208,13 @@ SSE-event-timestamping and is quick to rewrite (POST /threads, POST /ask, record
 clock of every `trace`/`sources`/`token`/`done` event, diff consecutive marks — the gaps
 between traces ARE the LLM turns).
 
-### What is actually worth points — the 19 missing automated points, itemised
+### What is actually worth points — the 17 missing automated points, itemised
 
 Read straight off the last report (`reports/report.json`), most valuable first:
 
 1. **~7 pts · Search & cited answers 13/20** — the one failing part is
-   `search cache hit rate 45%` (target ≥50%). **This is not a caching bug, and the
+   `search cache hit rate` **47.5%** as of 2026-09-19 (was 45%; target ≥50%). **This is not a
+   caching bug, and the
    hypothesis recorded here before (Mongo TTL expiry) is wrong.** `done.searchCached` is
    `searchCachedFrom()` in `tools/types.ts:91`: `searches > 0 && searches === searchHits` —
    true only if **every** search in the run hit the cache. The bench's workload is 20 fresh
@@ -139,16 +235,21 @@ Read straight off the last report (`reports/report.json`), most valuable first:
      75 → 66 drop is that, **not** #1/#1b/#2 regressing anything — nobody should read the
      run-over-run trend as "every fix makes it worse", because two of those runs were
      measuring different cache states, not different code.
-   - The measured refinement rate is **9.9%** (37 of 375 quick web runs issue more than one
-     `web_search`). 9.9% × 20 repeats ≈ 2 lost → 18/40 = 45%. That is the observed number
-     exactly, which is what confirms the diagnosis.
+   - The measured refinement rate was **9.9%** (37 of 375 quick web runs issue more than one
+     `web_search`). 9.9% × 20 repeats ≈ 2 lost → 18/40 = 45%. That was the observed number
+     exactly, which is what confirmed the diagnosis. **After #4 (2026-09-19): 19/40 = 47.5%,
+     i.e. 1 repeat lost.** Reproduce the rate for free with the one-liner in "cheap tools"
+     below — over *this* bench's runs it reads 13/111 = 11.7%, and all 13 also exceeded the
+     $0.05 quick budget, which is the tightest evidence yet that the two rows are one bug.
 2. **~3.3 pts · Performance & SLA, part 2** — `quickBudget`: 11/75 quick runs exceeded
    $0.05 or 8 tool calls. Same root cause: a second search+fetch round is what pushes a run
    over. This is fast-follow #1's genuinely unresolved remainder.
 3. **~3.3 pts · Performance & SLA, part 3** — `quality.errors === 0`, currently 1 error
    (A2) + 2 warnings over 586 run logs. See #2 in the priority list below.
-4. **~3.3 pts · Performance & SLA, part 1** — `bench.pass`. **Unreachable**, see the box at
-   the top. Write it off.
+4. **~3.3 pts · Performance & SLA, part 1** — `bench.pass`. **No longer written off — see
+   the retraction box at the top.** It needs ttft, answer p95, deep plan p95 and cache all
+   passing at once, which is the hardest item here, but it is reachable via Lever 2 and it
+   gates the whole 10-point row rather than just its own third.
 5. **2 pts · Deep search 13/15** — the deep cap+1 429 probe failed with
    `The operation was aborted due to timeout`. That is a *timeout*, not a wrong status code,
    so it may simply be fixed by #3b's extra vCPU. Cheapest 2 points on the board: re-run the
@@ -245,9 +346,10 @@ Real numbers from the last full bench run against the deployed gateway
    Atlas hop nor the loop: it was the synchronous jsdom parse in `tools/fetch_page.ts`
    blocking a single-vCPU event loop for every concurrent request at once. Full write-up,
    numbers and commits in "What fast-follow #3 actually found" at the top of this file.
-   - **Do not spend another session here.** Both remaining targets are out of reach and,
-     more to the point, worth nothing — see the box at the top for why `bench.pass` cannot
-     go true while `ttft_p95_ms` is 2500. The measured floor is ~4.7s.
+   - **Superseded.** This used to read "do not spend another session here — both targets are
+     out of reach and worth nothing." That was wrong; see the retraction box at the top. The
+     ~4.7s floor is real only while the Phase-1 turn sits on the critical path, and ttft is
+     measured on **quick**, which has no plan-before-retrieval requirement.
    - What is left in the latency budget, if you ever need it for the product rather than
      the score: the **Phase-1 LLM turn is 2.4-3.7s of every request**, consistently, and is
      now the single largest component. Overlapping it with an eager fetch of the top search
@@ -341,6 +443,16 @@ fixing what the eval measures, not for editing the grader.
 2. `benchmark/sla.json`, `expectations.json`, `eval/rubric.json` — all thresholds
 3. `AGENTS.md` → 4. `SPEC.md` → 5. `TECHSPEC.md`, `DESIGN.md` (mine)
 
+**Who wrote what — verified by `git log`, and it matters for any "did I get this wrong?"
+argument.** Every commit that has ever touched `SPEC.md`, `AGENTS.md`, `PRD.md` or
+`benchmark/sla.json` is **hamzafarooq** (the instructor). `TECHSPEC.md` and `DESIGN.md` are
+the only design docs authored here (`897736c`, Hoyin Wan). `git log -S"ttft_p95_ms" --
+benchmark/sla.json` shows the 2500ms value was set only by the instructor, last touched in
+`7ba82d5` — **the same commit that last edited `SPEC.md`**. So the Must rows requiring
+full-page fetch and the loop, and the latency target that fights the literal reading of them,
+shipped together from the same author. Nothing in this repo's history supports "you built
+past a budget you set."
+
 ---
 
 ## Deploy state
@@ -418,8 +530,12 @@ goes to:
 
 - **`mine`** remote → `https://github.com/hoyinwan07/multi-agent-course.git` (your own fork)
 - Branch: **`2026-03-hoyinwan/lumina-week1`** — what Vercel's Production Branch is set to.
-- **Local `main` and `mine/2026-03-hoyinwan/lumina-week1` are identical at `10da115`.**
-  Everything is pushed. No pending commits.
+- **Local `main` and `mine/2026-03-hoyinwan/lumina-week1` are identical at `f181eaa`.**
+  The only uncommitted change is **this file** (the 2026-09-19 rewrite). `reports/` and
+  `runs/` are **gitignored** (`.gitignore:7-8`) and never committed — which is why there is
+  no bench baseline in git history to diff against, and why the pre-#4 `bench.json` was lost
+  when this run overwrote it. If you want run-over-run SLA comparisons, copy
+  `reports/bench.json` somewhere before the next bench.
 - Local `main` is deliberately never synced with `origin` — expected drift, ignore it.
 
 Commits, oldest first:
@@ -467,11 +583,13 @@ Commits, oldest first:
 2. `normalize()` has NO NFKC — matches `benchmark/lib.mjs`.
 3. Longer snippets are safer; 30-token windows.
 4. `res.on('close')`, never `req.on('close')`, in both the agent and the gateway.
-5. TTFT 2500ms is unreachable, and after fast-follow #3 the floor is understood rather than
-   guessed at: ~4.7s deployed, made of ~0.3s eager recall+search, **2.4-3.7s for the
-   Phase-1 LLM turn**, ~0.6s for the parallel fetches and ~1.0s to the synthesis stream's
-   first token. p95 sits at 10.2s because slow pages and refinement rounds land on top of
-   that floor. (Pre-#3 this line read "≈3.6s local / 24.4s deployed" and the gap was
+5. **CORRECTED.** This used to read "TTFT 2500ms is unreachable." It is unreachable only
+   *with the Phase-1 LLM turn on the critical path*. The floor is ~4.7s deployed, made of
+   ~0.3s eager recall+search, **2.4-3.7s for the Phase-1 LLM turn**, ~0.6s for the parallel
+   fetches and ~1.0s to the synthesis stream's first token — and the Phase-1 turn is the only
+   term that breaks the budget. Take it off the critical path (retraction box at the top) and
+   the floor is ~1.9s. p95 sits at 10-11s because slow pages and refinement rounds land on top
+   of the floor. (Pre-#3 this line read "≈3.6s local / 24.4s deployed" and the gap was
    unexplained; it was the jsdom parse blocking the event loop.)
 6. LLM turns are ~74% of latency, tools ~26% — still true, and #3 sharpened it: with the
    parse bounded, the Phase-1 turn alone is 2.4-3.7s of a ~4.7s floor.
